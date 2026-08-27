@@ -1,0 +1,9 @@
+[package]
+name = "tengin-cli"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tengin = { path = ".." }
+tengin-test262 = { path = "../tengin-test262" }
+mimalloc = "0.1"

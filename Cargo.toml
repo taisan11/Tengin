@@ -1,0 +1,15 @@
+[package]
+name = "tengin"
+version = "0.1.0"
+edition = "2024"
+description = "A small JavaScript engine written in Rust, designed to run in no_std + alloc environments."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/taisan11/Tengin"
+keywords = ["javascript", "ecmascript", "engine", "interpreter", "no_std"]
+categories = ["no-std", "parser-implementations", "wasm"]
+
+[workspace]
+members = ["tengin-cli", "tengin-test262"]
+
+[dependencies]
+libm = "0.2"

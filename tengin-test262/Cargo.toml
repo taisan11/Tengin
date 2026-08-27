@@ -1,0 +1,9 @@
+[package]
+name = "tengin-test262"
+version = "0.1.0"
+edition = "2024"
+description = "test262 harness runner for the Tengin JavaScript engine."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+tengin = { path = ".." }
