@@ -1,5 +1,5 @@
 use alloc::rc::Rc;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use core::cell::RefCell;
 
 use crate::value::Value;
@@ -9,6 +9,11 @@ use crate::value::Value;
 pub struct Env {
     pub vars: BTreeMap<Rc<str>, Value>,
     pub outer: Option<Rc<RefCell<Env>>>,
+    /// Whether `var` declarations bind inside this scope (`true` for function
+    /// and global scopes) rather than being hoisted to a containing function.
+    pub function_scope: bool,
+    /// Names bound as `const` in this scope (reassignment is a TypeError).
+    pub constants: BTreeSet<Rc<str>>,
 }
 
 impl Env {
@@ -16,14 +21,67 @@ impl Env {
         Env {
             vars: BTreeMap::new(),
             outer: None,
+            function_scope: true,
+            constants: BTreeSet::new(),
         }
     }
 
-    #[allow(dead_code)]
+    /// Create a new function (or catch-free) scope whose `var`s bind locally.
     pub fn new_child(outer: Rc<RefCell<Env>>) -> Self {
         Env {
             vars: BTreeMap::new(),
             outer: Some(outer),
+            function_scope: true,
+            constants: BTreeSet::new(),
+        }
+    }
+
+    /// Create a block scope (`let`/`const` bind here; `var` climbs out).
+    pub fn new_block(outer: Rc<RefCell<Env>>) -> Self {
+        Env {
+            vars: BTreeMap::new(),
+            outer: Some(outer),
+            function_scope: false,
+            constants: BTreeSet::new(),
+        }
+    }
+
+    /// The nearest enclosing function/global scope, used to place `var`s.
+    ///
+    /// Walks the strong `outer` chain until a scope with
+    /// `function_scope == true` is found (the global scope always is).
+    pub fn function_scope(env: &Rc<RefCell<Env>>) -> Rc<RefCell<Env>> {
+        let mut cur = env.clone();
+        loop {
+            let (is_fn, next): (bool, Option<Rc<RefCell<Env>>>) = {
+                let c = cur.borrow();
+                (c.function_scope, c.outer.clone())
+            };
+            if is_fn {
+                return cur;
+            }
+            match next {
+                Some(o) => cur = o,
+                None => return cur,
+            }
+        }
+    }
+
+    /// Whether `name` is bound as a `const` in the scope chain that owns it.
+    pub fn binding_is_const(name: &str, env: &Rc<RefCell<Env>>) -> bool {
+        let mut cur = env.clone();
+        loop {
+            let (found, is_const, next): (bool, bool, Option<Rc<RefCell<Env>>>) = {
+                let g = cur.borrow();
+                (g.vars.contains_key(name), g.constants.contains(name), g.outer.clone())
+            };
+            if found {
+                return is_const;
+            }
+            match next {
+                Some(o) => cur = o,
+                None => return false,
+            }
         }
     }
 

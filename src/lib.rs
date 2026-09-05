@@ -1,9 +1,9 @@
-#![no_std]
-//! Tengin: a small JavaScript engine that runs in `no_std` + `alloc` environments.
+//! Tengin: a small JavaScript engine.
 //!
-//! The crate is a tree-walking interpreter with a hand-written lexer and parser.
-//! The only dependency is [`libm`](https://docs.rs/libm), so the core engine can
-//! be built for targets without the standard library.
+//! Tengin parses and evaluates JavaScript using the [Oxc](https://oxc.rs/)
+//! parser (`oxc_parser` / `oxc_ast`), then runs a tree-walking interpreter over
+//! the resulting AST. Note: Tengin requires `std` (Oxc is not `no_std`
+//! compatible), so the earlier `no_std` + `alloc` design was retired.
 //!
 //! # Quick start
 //!
@@ -17,8 +17,8 @@
 //!
 //! # Architecture
 //!
-//! - [`lexer`] turns source text into tokens.
-//! - [`parser`] produces the AST in [`ast`].
+//! - [`parser`] turns source text into an AST using Oxc, then converts it into
+//!   the interpreter's AST in [`ast`].
 //! - [`interpreter`] evaluates the AST against an [`Engine`].
 //! - [`value`] defines the JavaScript [`Value`] representation.
 //! - [`builtins`] installs the standard library (`Object`, `Array`, `Math`, …).
@@ -30,7 +30,6 @@ pub mod builtins;
 pub mod environment;
 pub mod error;
 pub mod interpreter;
-pub mod lexer;
 pub mod parser;
 pub mod value;
 

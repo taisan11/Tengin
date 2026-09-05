@@ -13,3 +13,8 @@ members = ["tengin-cli", "tengin-test262"]
 
 [dependencies]
 libm = "0.2"
+oxc_allocator = "0.147.0"
+oxc_ast = "0.147.0"
+oxc_parser = "0.147.0"
+oxc_span = "0.147.0"
+regex = "1"

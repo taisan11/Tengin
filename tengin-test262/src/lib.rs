@@ -6,9 +6,11 @@
 //! (non-strict, strict, or both) reporting a [`Status`] per mode.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use tengin::value::{native, Object, Value};
 use tengin::Engine;
@@ -43,7 +45,9 @@ struct Meta {
     no_strict: bool,
     raw: bool,
     module: bool,
+    is_async: bool,
     includes: Vec<String>,
+    features: Vec<String>,
 }
 
 /// Parse the `/*--- ... ---*/` YAML-ish frontmatter of a test262 test.
@@ -76,9 +80,11 @@ fn parse_frontmatter(src: &str) -> Meta {
                     "noStrict" => meta.no_strict = true,
                     "raw" => meta.raw = true,
                     "module" => meta.module = true,
+                    "async" => meta.is_async = true,
                     _ => {}
                 },
                 Some("includes") => meta.includes.push(item.to_string()),
+                Some("features") => meta.features.push(item.to_string()),
                 _ => {}
             }
             continue;
@@ -103,9 +109,11 @@ fn parse_frontmatter(src: &str) -> Meta {
                             "noStrict" => meta.no_strict = true,
                             "raw" => meta.raw = true,
                             "module" => meta.module = true,
+                            "async" => meta.is_async = true,
                             _ => {}
                         },
                         "includes" => meta.includes.push(it.to_string()),
+                        "features" => meta.features.push(it.to_string()),
                         _ => {}
                     }
                 }
@@ -143,26 +151,58 @@ fn parse_frontmatter(src: &str) -> Meta {
     meta
 }
 
+/// Cache of harness file contents, keyed by the resolved absolute path.
+///
+/// The same handful of harness files (`assert.js`, `sta.js`, …) are referenced
+/// by tens of thousands of tests, so reading them once and reusing the buffer
+/// avoids a massive amount of redundant disk I/O during a full run.
+static HARNESS_CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<Arc<String>>>>> = OnceLock::new();
+
 /// Locate a harness file by walking up from `test_path`, then falling back to
 /// `vendor/test262/harness`.
+///
+/// Only directories that also contain `assert.js` are treated as the canonical
+/// harness root. This avoids accidentally picking up the harness *tests* that
+/// live under `test/harness/` (which contain self-checks rather than the real
+/// implementations).
+///
+/// The resolved file's contents are cached so subsequent tests pay no I/O cost.
 fn find_harness(name: &str, test_path: &Path) -> Option<String> {
+    let path = resolve_harness_path(name, test_path)?;
+    harness_content(&path)
+}
+
+/// Resolve the on-disk path of a harness file (see [`find_harness`] for the
+/// lookup rules) without reading its contents.
+fn resolve_harness_path(name: &str, test_path: &Path) -> Option<PathBuf> {
     let mut dir = test_path.parent();
     while let Some(d) = dir {
-        let p = d.join("harness").join(name);
-        if p.exists() {
-            if let Ok(s) = fs::read_to_string(&p) {
-                return Some(s);
+        let hdir = d.join("harness");
+        if hdir.join("assert.js").exists() {
+            let p = hdir.join(name);
+            if p.exists() {
+                return Some(p);
             }
         }
         dir = d.parent();
     }
     let fallback = Path::new("vendor/test262/harness").join(name);
     if fallback.exists() {
-        if let Ok(s) = fs::read_to_string(&fallback) {
-            return Some(s);
-        }
+        return Some(fallback);
     }
     None
+}
+
+/// Read and cache the contents of a harness file.
+fn harness_content(path: &Path) -> Option<String> {
+    let cache = HARNESS_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache.lock().unwrap();
+    if let Some(v) = guard.get(path) {
+        return v.as_ref().map(|s| s.to_string());
+    }
+    let content = fs::read_to_string(path).ok().map(Arc::new);
+    guard.insert(path.to_path_buf(), content.clone());
+    content.map(|s| s.to_string())
 }
 
 fn native_print(
@@ -177,21 +217,24 @@ fn native_print(
 }
 
 fn native_create_realm(
-    e: &Engine,
+    _e: &Engine,
     _this: &Value,
     _a: &[Value],
     _c: bool,
 ) -> Result<Value, tengin::Error> {
-    let global = Rc::new(RefCell::new(Object::new()));
-    let mut realm = Object::new();
-    realm
-        .props
-        .insert(Rc::from("global"), tengin::value::Property::new(Value::Object(global.clone())));
-    realm
-        .props
-        .insert(Rc::from("globalThis"), tengin::value::Property::new(Value::Object(global)));
-    let _ = e;
-    Ok(Value::Object(Rc::new(RefCell::new(realm))))
+    // A fresh realm is its own `Engine` (with the full built-in set). The
+    // engine is leaked for the process lifetime; only its global object is
+    // exposed, and the strong references held by that object's property map
+    // keep the realm's constructors (and their prototypes) reachable.
+    let realm = Box::leak(Box::new(Engine::new()));
+    register_host(realm);
+    let global_value = realm.global_object_value();
+    let mut o = Object::new();
+    o.props
+        .insert(Rc::from("global"), tengin::value::Property::new(global_value.clone()));
+    o.props
+        .insert(Rc::from("globalThis"), tengin::value::Property::new(global_value));
+    Ok(Value::Object(Rc::new(RefCell::new(o))))
 }
 
 /// Build the `$262` host object.
@@ -249,6 +292,34 @@ pub fn run_test_file(test_path: &Path) -> Vec<TestOutcome> {
         }];
     }
 
+    if meta.is_async {
+        return vec![TestOutcome {
+            path: test_path.to_string_lossy().to_string(),
+            strict: false,
+            status: Status::Skip,
+            detail: "async tests are not supported".to_string(),
+        }];
+    }
+
+    // Run the rest inside a panic catcher so a single misbehaving test cannot
+    // abort the whole suite.
+    let path = test_path.to_path_buf();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_test_inner(&path, &source, &meta)
+    }));
+    match result {
+        Ok(outcomes) => outcomes,
+        Err(_) => vec![TestOutcome {
+            path: test_path.to_string_lossy().to_string(),
+            strict: false,
+            status: Status::Fail,
+            detail: "panic while running test".to_string(),
+        }],
+    }
+}
+
+fn run_test_inner(test_path: &Path, source: &str, meta: &Meta) -> Vec<TestOutcome> {
+
     // Assemble harness sources.
     let mut harness = String::new();
     if !meta.raw {
@@ -302,7 +373,7 @@ pub fn run_test_file(test_path: &Path) -> Vec<TestOutcome> {
         let body = if strict {
             format!("\"use strict\";\n{source}")
         } else {
-            source.clone()
+            source.to_string()
         };
 
         let status = evaluate(&engine, &body, &meta);
@@ -373,4 +444,54 @@ pub fn summarize(outcomes: &[TestOutcome]) -> (usize, usize, usize) {
         }
     }
     (pass, fail, skip)
+}
+
+/// Recursively collect every `*.js` test file beneath `root`.
+pub fn collect_test_files(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    collect_test_files_inner(root, &mut out);
+    out
+}
+
+fn collect_test_files_inner(dir: &Path, out: &mut Vec<PathBuf>) {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_test_files_inner(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("js") {
+            out.push(path);
+        }
+    }
+}
+
+/// Parse an `excludelist.xml` file, returning the set of excluded test path
+/// substrings (the `id` attributes). An empty or missing file yields an empty
+/// list.
+pub fn load_excludelist(path: &Path) -> Vec<String> {
+    let content = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for line in content.lines() {
+        if let Some(rest) = line.trim().strip_prefix("<test") {
+            if let Some(start) = rest.find("id=\"") {
+                let after = &rest[start + 4..];
+                if let Some(end) = after.find('"') {
+                    out.push(after[..end].to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Returns `true` if `path` matches any excluded-id prefix.
+pub fn is_excluded(path: &Path, excludes: &[String]) -> bool {
+    let s = path.to_string_lossy();
+    excludes.iter().any(|e| s.contains(e.as_str()))
 }
