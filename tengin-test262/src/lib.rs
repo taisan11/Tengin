@@ -216,6 +216,33 @@ fn native_print(
     Ok(Value::Undefined)
 }
 
+std::thread_local! {
+    /// Async-test `$DONE` state for the currently running test on this thread:
+    /// `(called, error_detail)`. Reset before each mode evaluation.
+    static DONE_STATE: RefCell<(bool, Option<String>)> = RefCell::new((false, None));
+}
+
+fn native_done(
+    _e: &Engine,
+    _this: &Value,
+    a: &[Value],
+    _c: bool,
+) -> Result<Value, tengin::Error> {
+    let err = a.first().cloned().unwrap_or(Value::Undefined);
+    let detail = match &err {
+        Value::Undefined => None,
+        other => Some(other.error_message().to_string()),
+    };
+    DONE_STATE.with(|s| *s.borrow_mut() = (true, detail));
+    Ok(Value::Undefined)
+}
+
+/// Register the async-test `$DONE` callback for one evaluation.
+fn register_async(engine: &mut Engine) {
+    DONE_STATE.with(|s| *s.borrow_mut() = (false, None));
+    engine.register_global("$DONE", native(native_done));
+}
+
 fn native_create_realm(
     _e: &Engine,
     _this: &Value,
@@ -292,15 +319,6 @@ pub fn run_test_file(test_path: &Path) -> Vec<TestOutcome> {
         }];
     }
 
-    if meta.is_async {
-        return vec![TestOutcome {
-            path: test_path.to_string_lossy().to_string(),
-            strict: false,
-            status: Status::Skip,
-            detail: "async tests are not supported".to_string(),
-        }];
-    }
-
     // Run the rest inside a panic catcher so a single misbehaving test cannot
     // abort the whole suite.
     let path = test_path.to_path_buf();
@@ -357,6 +375,9 @@ fn run_test_inner(test_path: &Path, source: &str, meta: &Meta) -> Vec<TestOutcom
     for strict in modes {
         let mut engine = Engine::new();
         register_host(&mut engine);
+        if meta.is_async {
+            register_async(&mut engine);
+        }
 
         if !harness.is_empty() {
             if let Err(e) = engine.eval(&harness) {
@@ -416,9 +437,50 @@ fn evaluate(engine: &Engine, body: &str, meta: &Meta) -> (Status, String) {
         // `early` / `resolution` negatives cannot be detected by this interpreter.
         Some(_) => (Status::Skip, "negative phase not detectable".to_string()),
         None => match engine.eval(body) {
-            Ok(_) => (Status::Pass, String::new()),
+            Ok(_) => {
+                // Unhandled rejections are only checked for async tests: sync
+                // tests routinely construct (and inspect) rejected promises
+                // without attaching handlers.
+                if meta.is_async {
+                    return check_async_completion(engine);
+                }
+                (Status::Pass, String::new())
+            }
             Err(e) => (Status::Fail, format!("{e}")),
         },
+    }
+}
+
+/// After an async test's evaluation (jobs drained): require `$DONE`, surface
+/// a `$DONE(error)`, and report unhandled rejections.
+fn check_async_completion(engine: &Engine) -> (Status, String) {
+    let (called, err) = DONE_STATE.with(|s| s.borrow().clone());
+    if !called {
+        return (
+            Status::Fail,
+            "async test did not call $DONE".to_string(),
+        );
+    }
+    if let Some(detail) = err {
+        return (Status::Fail, format!("$DONE called with error: {detail}"));
+    }
+    check_unhandled(engine)
+}
+
+/// Report unhandled promise rejections / microtask exceptions, if any.
+fn check_unhandled(engine: &Engine) -> (Status, String) {
+    let unhandled = engine.take_unhandled();
+    if unhandled.is_empty() {
+        (Status::Pass, String::new())
+    } else {
+        let first = unhandled
+            .first()
+            .map(|v| v.error_message().to_string())
+            .unwrap_or_default();
+        (
+            Status::Fail,
+            format!("unhandled rejection ({}): {first}", unhandled.len()),
+        )
     }
 }
 
@@ -494,4 +556,110 @@ pub fn load_excludelist(path: &Path) -> Vec<String> {
 pub fn is_excluded(path: &Path, excludes: &[String]) -> bool {
     let s = path.to_string_lossy();
     excludes.iter().any(|e| s.contains(e.as_str()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn write_temp(name: &str, contents: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join("tengin-test262-tests");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn frontmatter_parses_flags_in_block_and_inline_form() {
+        let meta = parse_frontmatter(
+            "/*---\nflags: [onlyStrict, module]\n---*/\n0;",
+        );
+        assert!(meta.only_strict);
+        assert!(meta.module);
+        assert!(!meta.no_strict);
+
+        let meta = parse_frontmatter(
+            "/*---\nflags:\n  - noStrict\n  - raw\n---*/\n0;",
+        );
+        assert!(meta.no_strict);
+        assert!(meta.raw);
+    }
+
+    #[test]
+    fn frontmatter_parses_includes_and_negative() {
+        let meta = parse_frontmatter(
+            "/*---\nincludes: [compareArray.js]\nnegative:\n  phase: runtime\n  type: RangeError\n---*/\n0;",
+        );
+        assert_eq!(meta.includes, vec!["compareArray.js".to_string()]);
+        assert_eq!(meta.negative_phase.as_deref(), Some("runtime"));
+        assert_eq!(meta.negative_type.as_deref(), Some("RangeError"));
+    }
+
+    #[test]
+    fn frontmatter_without_block_is_default() {
+        let meta = parse_frontmatter("// no frontmatter here");
+        assert!(meta.includes.is_empty());
+        assert_eq!(meta.negative_phase, None);
+        assert!(!meta.raw);
+        assert!(!meta.module);
+        assert!(!meta.only_strict);
+        assert!(!meta.no_strict);
+    }
+
+    #[test]
+    fn excludelist_parsing_and_matching() {
+        let path = write_temp(
+            "excludelist.xml",
+            "<excludeList>\n<test id=\"test/built-ins/Math/abs\"><![CDATA[x]]></test>\n<test id=\"test/foo/bar\"/>\n</excludeList>",
+        );
+        let excludes = load_excludelist(&path);
+        assert_eq!(excludes.len(), 2);
+        assert!(excludes.contains(&"test/built-ins/Math/abs".to_string()));
+        assert!(excludes.contains(&"test/foo/bar".to_string()));
+
+        assert!(is_excluded(Path::new("vendor/test262/test/built-ins/Math/abs/x.js"), &excludes));
+        assert!(!is_excluded(Path::new("test/built-ins/JSON/stringify.js"), &excludes));
+    }
+
+    #[test]
+    fn missing_excludelist_is_empty() {
+        assert!(load_excludelist(Path::new("/nonexistent/excludelist.xml")).is_empty());
+    }
+
+    #[test]
+    fn summarize_counts_outcomes() {
+        let outcomes = vec![
+            TestOutcome { path: String::new(), strict: false, status: Status::Pass, detail: String::new() },
+            TestOutcome { path: String::new(), strict: true, status: Status::Fail, detail: String::new() },
+            TestOutcome { path: String::new(), strict: false, status: Status::Skip, detail: String::new() },
+            TestOutcome { path: String::new(), strict: false, status: Status::Pass, detail: String::new() },
+        ];
+        assert_eq!(summarize(&outcomes), (2, 1, 1));
+        assert_eq!(summarize(&[]), (0, 0, 0));
+    }
+
+    #[test]
+    fn collect_test_files_finds_js_recursively() {
+        let root = std::env::temp_dir().join("tengin-test262-tests/collect");
+        let nested = root.join("a/b");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(root.join("top.js"), "").unwrap();
+        fs::write(nested.join("deep.js"), "").unwrap();
+        fs::write(root.join("readme.txt"), "").unwrap();
+
+        let mut files = collect_test_files(&root);
+        files.sort();
+        let names: Vec<String> =
+            files.iter().map(|p| p.file_name().unwrap().to_string_lossy().to_string()).collect();
+        assert_eq!(names, vec!["deep.js".to_string(), "top.js".to_string()]);
+    }
+
+    #[test]
+    fn missing_test_file_reports_failure_not_panic() {
+        let outcomes = run_test_file(Path::new("/nonexistent/tengin-test-case.js"));
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].status, Status::Fail);
+    }
 }

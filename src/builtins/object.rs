@@ -9,10 +9,17 @@ use crate::interpreter::Engine;
 use crate::ast::Pattern;
 use crate::value::{ArrayData, Object, Property, Value};
 
-use super::helpers::{native, set_proto_of_val, wrap, proto_of};
+use super::helpers::{key_arg, native, proto_of, set_proto_of_val, wrap};
 // --- Object.prototype ---
 
-pub(crate) fn obj_to_string(_e: &Engine, this: &Value, _a: &[Value], _c: bool) -> Result<Value, Error> {
+pub(crate) fn obj_to_string(e: &Engine, this: &Value, _a: &[Value], _c: bool) -> Result<Value, Error> {
+    // A well-known `Symbol.toStringTag` on the object (or its chain) takes
+    // precedence, per `Object.prototype.toString`.
+    let tag_key = crate::value::SymbolData::well_known_key("toStringTag");
+    let custom = e.get_property(this, tag_key.as_ref());
+    if let Value::String(s) = custom {
+        return Ok(Value::String(Rc::from(format!("[object {}]", s))));
+    }
     let tag = if let Some(p) = this.primitive_value() {
         match p {
             Value::String(_) => "String",
@@ -24,10 +31,21 @@ pub(crate) fn obj_to_string(_e: &Engine, this: &Value, _a: &[Value], _c: bool) -
         "Array"
     } else if let Value::Function(_) | Value::NativeFunction(_) = this {
         "Function"
+    } else if has_error_data_slot(e, this) {
+        "Error"
     } else {
         "Object"
     };
     Ok(Value::String(Rc::from(format!("[object {tag}]"))))
+}
+
+/// Whether the object carries the `[[ErrorData]]` internal slot (stored as a
+/// non-enumerable internal property).
+fn has_error_data_slot(_e: &Engine, this: &Value) -> bool {
+    match this {
+        Value::Object(o) => o.borrow().props.contains_key("__error_data__"),
+        _ => false,
+    }
 }
 
 pub(crate) fn obj_value_of(_e: &Engine, this: &Value, _a: &[Value], _c: bool) -> Result<Value, Error> {
@@ -39,7 +57,7 @@ pub(crate) fn obj_value_of(_e: &Engine, this: &Value, _a: &[Value], _c: bool) ->
 }
 
 pub(crate) fn obj_has_own(e: &Engine, this: &Value, a: &[Value], _c: bool) -> Result<Value, Error> {
-    let key = a.first().cloned().unwrap_or(Value::Undefined).to_string();
+    let key = key_arg(a.first().unwrap_or(&Value::Undefined));
     Ok(Value::Boolean(e.has_own(this, key.as_ref())))
 }
 
@@ -64,7 +82,7 @@ pub(crate) fn obj_is_proto_of(_e: &Engine, this: &Value, a: &[Value], _c: bool) 
 }
 
 pub(crate) fn obj_prop_enum(e: &Engine, this: &Value, a: &[Value], _c: bool) -> Result<Value, Error> {
-    let key = a.first().cloned().unwrap_or(Value::Undefined).to_string();
+    let key = key_arg(a.first().unwrap_or(&Value::Undefined));
     Ok(Value::Boolean(e.prop_enumerable(this, key.as_ref()).unwrap_or(false)))
 }
 
@@ -83,7 +101,11 @@ pub(crate) fn object_ctor(e: &Engine, this: &Value, a: &[Value], construct: bool
             Value::Object(_) | Value::Array(_) | Value::Function(_) | Value::NativeFunction(_) => {
                 Ok(v)
             }
-            Value::String(_) | Value::Number(_) | Value::Boolean(_) => Ok(wrap(e, v)),
+            Value::String(_)
+            | Value::Number(_)
+            | Value::Boolean(_)
+            | Value::BigInt(_)
+            | Value::Symbol(_) => Ok(wrap(e, v)),
             _ => Ok(this.clone()),
         }
     } else {
@@ -91,6 +113,12 @@ pub(crate) fn object_ctor(e: &Engine, this: &Value, a: &[Value], construct: bool
             Value::Object(_) | Value::Array(_) | Value::Function(_) | Value::NativeFunction(_) => {
                 Ok(v)
             }
+            // `Object(value)` == ToObject(value): primitives are wrapped.
+            Value::String(_)
+            | Value::Number(_)
+            | Value::Boolean(_)
+            | Value::BigInt(_)
+            | Value::Symbol(_) => Ok(wrap(e, v)),
             _ => Ok(Value::Object(e.new_object())),
         }
     }
@@ -125,6 +153,60 @@ pub(crate) fn function_ctor(e: &Engine, _this: &Value, a: &[Value], _c: bool) ->
         .unwrap_or_else(|| e.realm.clone());
     let closure = realm.global_env.clone();
     let fval = e.make_function_value(Rc::from(""), params, prog.stmts, closure);
+    if let Value::Function(f) = &fval {
+        f.borrow_mut().realm = Some(realm);
+    }
+    Ok(fval)
+}
+
+/// `AsyncFunction(p1, p2, ..., body)`: like `Function`, but the body runs as
+/// an async function (created functions return promises).
+pub(crate) fn async_function_ctor(e: &Engine, _this: &Value, a: &[Value], _c: bool) -> Result<Value, Error> {
+    let (params_str, body_str) = if a.is_empty() {
+        (Vec::new(), alloc::string::String::new())
+    } else {
+        let body = a.last().unwrap().to_string().to_string();
+        let params: Vec<alloc::string::String> = a[..a.len() - 1]
+            .iter()
+            .map(|v| v.to_string().to_string())
+            .collect();
+        (params, body)
+    };
+    let params: Vec<Pattern> = params_str
+        .iter()
+        .flat_map(|s| s.split(','))
+        .map(|p| Pattern::Ident(Rc::from(p.trim())))
+        .collect();
+    // Parse the body as an async function body (so `await`/`return` are
+    // valid) by wrapping it in a synthetic declaration and unwrapping.
+    let wrapped = alloc::format!("async function __async_fn_tmp(){{{body_str}}}");
+    let prog = crate::parser::parse(&wrapped)
+        .map_err(|e| Error::Runtime(Value::String(Rc::from(e.to_string()))))?;
+    let body_stmts = prog
+        .stmts
+        .iter()
+        .find_map(|s| match s {
+            crate::ast::Stmt::FunctionDecl { name, body, .. }
+                if name.as_ref() == "__async_fn_tmp" =>
+            {
+                Some(body.clone())
+            }
+            _ => None,
+        })
+        .ok_or_else(|| {
+            Error::Runtime(Value::String(Rc::from(
+                "AsyncFunction body parse failed",
+            )))
+        })?;
+    let realm = e
+        .native_realm
+        .borrow()
+        .clone()
+        .unwrap_or_else(|| e.realm.clone());
+    let closure = realm.global_env.clone();
+    // The unwrapped declaration body is already `[AsyncBody(..)]` (the
+    // wrapped source is async); pass it through so `make_function` flags it.
+    let fval = e.make_function_value(Rc::from("anonymous"), params, body_stmts, closure);
     if let Value::Function(f) = &fval {
         f.borrow_mut().realm = Some(realm);
     }
@@ -220,7 +302,7 @@ pub(crate) fn obj_create(e: &Engine, _this: &Value, a: &[Value], _c: bool) -> Re
 
 pub(crate) fn obj_define_property(e: &Engine, _this: &Value, a: &[Value], _c: bool) -> Result<Value, Error> {
     let obj = a.first().cloned().unwrap_or(Value::Undefined);
-    let key = a.get(1).cloned().unwrap_or(Value::Undefined).to_string();
+    let key = key_arg(a.get(1).unwrap_or(&Value::Undefined));
     let desc = a.get(2).cloned().unwrap_or(Value::Undefined);
     e.define_property(&obj, key.as_ref(), &desc)?;
     Ok(obj)
@@ -239,7 +321,7 @@ pub(crate) fn obj_define_properties(e: &Engine, _this: &Value, a: &[Value], _c: 
 
 pub(crate) fn obj_get_own_descriptor(e: &Engine, _this: &Value, a: &[Value], _c: bool) -> Result<Value, Error> {
     let obj = a.first().cloned().unwrap_or(Value::Undefined);
-    let key = a.get(1).cloned().unwrap_or(Value::Undefined).to_string();
+    let key = key_arg(a.get(1).unwrap_or(&Value::Undefined));
     Ok(e.get_own_descriptor(&obj, key.as_ref()))
 }
 
@@ -274,9 +356,29 @@ pub(crate) fn obj_get_own_symbols(e: &Engine, _this: &Value, a: &[Value], _c: bo
     Ok(Value::Array(Rc::new(RefCell::new(ArrayData::new(syms, Some(e.array_prototype.clone()))))))
 }
 
-pub(crate) fn obj_get_proto_of(_e: &Engine, _this: &Value, a: &[Value], _c: bool) -> Result<Value, Error> {
+pub(crate) fn obj_get_proto_of(e: &Engine, _this: &Value, a: &[Value], _c: bool) -> Result<Value, Error> {
     let obj = a.first().cloned().unwrap_or(Value::Undefined);
-    Ok(proto_of(&obj).map(Value::Object).unwrap_or(Value::Null))
+    // Native functions may have a function-value `[[Prototype]]` (NativeError
+    // constructors chain to the `Error` constructor itself).
+    if let Value::NativeFunction(nf) = &obj {
+        if let Some(pv) = nf.borrow().fn_value_proto.clone() {
+            return Ok(pv);
+        }
+    }
+    if let Some(p) = proto_of(&obj) {
+        return Ok(Value::Object(p));
+    }
+    // Collection/promise values carry no explicit `[[Prototype]]` until
+    // `setPrototypeOf` overrides it; report the engine default.
+    let fallback = match &obj {
+        Value::Map(_) => Some(e.map_prototype.clone()),
+        Value::Set(_) => Some(e.set_prototype.clone()),
+        Value::WeakMap(_) => Some(e.weakmap_prototype.clone()),
+        Value::WeakSet(_) => Some(e.weakset_prototype.clone()),
+        Value::Promise(_) => Some(e.promise_prototype.clone()),
+        _ => None,
+    };
+    Ok(fallback.map(Value::Object).unwrap_or(Value::Null))
 }
 
 pub(crate) fn obj_set_proto_of(_e: &Engine, _this: &Value, a: &[Value], _c: bool) -> Result<Value, Error> {

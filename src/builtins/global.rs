@@ -259,7 +259,13 @@ pub(crate) fn eval_fn(e: &Engine, _this: &Value, a: &[Value], _c: bool) -> Resul
         return Ok(Value::Undefined);
     }
     let s = src.to_string();
-    e.eval(&s)
+    // A syntax error inside evaluated code is a runtime (catchable) error.
+    match e.eval(&s) {
+        Err(Error::Parse(msg)) => Err(Error::Runtime(Value::String(Rc::from(
+            format!("SyntaxError: {msg}"),
+        )))),
+        other => other,
+    }
 }
 
 pub(crate) fn make_assert(e: &Engine) -> Value {

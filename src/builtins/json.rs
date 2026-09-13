@@ -19,6 +19,7 @@ pub(crate) fn json_to_string(e: &Engine, v: &Value) -> String {
         Value::Undefined | Value::Function(_) | Value::NativeFunction(_) => "null".to_string(),
         Value::Symbol(_) => "null".to_string(),
         Value::Map(_) | Value::Set(_) | Value::WeakMap(_) | Value::WeakSet(_) => "{}".to_string(),
+        Value::Promise(_) => "{}".to_string(),
         Value::BigInt(s) => s.as_ref().to_string(),
         Value::Regex(_) => "null".to_string(),
         Value::Null => "null".to_string(),

@@ -69,7 +69,6 @@ impl Converter {
             ast::AssignmentTargetMaybeDefault::TSTypeAssertion(e) => {
                 self.convert_expr_as_pattern(&e.expression)
             }
-            _ => Err(Error::Parse("unsupported assignment target (elem)".to_string())),
         }
     }
 

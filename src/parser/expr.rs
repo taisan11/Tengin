@@ -18,9 +18,9 @@ impl Converter {
             ast::Expression::NullLiteral(_) => Ok(Expr::Lit(Lit::Null)),
             ast::Expression::NumericLiteral(n) => Ok(Expr::Lit(Lit::Number(n.value))),
             ast::Expression::BigIntLiteral(b) => {
-                let raw = b.raw.as_ref().map(|s| s.as_str()).unwrap_or("0");
-                let s = raw.trim_end_matches('n').to_string();
-                Ok(Expr::Lit(Lit::BigInt(Rc::from(s.as_str()))))
+                // oxc's `value` is the canonical base-10 digit string.
+                let s = b.value.as_str();
+                Ok(Expr::Lit(Lit::BigInt(Rc::from(s))))
             }
             ast::Expression::RegExpLiteral(r) => {
                 Ok(Expr::Lit(Lit::Regex {
@@ -70,8 +70,12 @@ impl Converter {
                 Ok(Expr::Object(props))
             }
             ast::Expression::FunctionExpression(f) => {
+                let name = f
+                    .id
+                    .as_ref()
+                    .map(|id| Rc::from(id.name.as_str()));
                 let (params, body) = self.convert_function(f)?;
-                Ok(Expr::Function { params, body })
+                Ok(Expr::Function { name, params, body })
             }
             ast::Expression::ClassExpression(c) => {
                 let class = self.convert_class(c, None)?;
@@ -88,6 +92,11 @@ impl Converter {
                         Some(e) => vec![Stmt::Return(Some(self.convert_expr(e)?))],
                         None => Vec::new(),
                     },
+                };
+                let body = if a.r#async {
+                    vec![Stmt::AsyncBody(body)]
+                } else {
+                    body
                 };
                 Ok(Expr::Arrow { params, body })
             }
@@ -228,11 +237,11 @@ impl Converter {
             }
             ast::Expression::ParenthesizedExpression(p) => self.convert_expr(&p.expression),
             ast::Expression::SequenceExpression(s) => {
-                let mut last: Option<Expr> = None;
+                let mut exprs: Vec<Expr> = Vec::with_capacity(s.expressions.len());
                 for e in &s.expressions {
-                    last = Some(self.convert_expr(e)?);
+                    exprs.push(self.convert_expr(e)?);
                 }
-                last.ok_or_else(|| Error::Parse("empty sequence".to_string()))
+                Ok(Expr::Sequence(exprs))
             }
             ast::Expression::TaggedTemplateExpression(t) => {
                 let tag = self.convert_expr(&t.tag)?;
@@ -303,7 +312,9 @@ impl Converter {
         let first = t.quasis.first().map(quasi_str).unwrap_or_default();
         pieces.push(Expr::Lit(Lit::String(Rc::from(first.as_str()))));
         for (i, e) in t.expressions.iter().enumerate() {
-            pieces.push(self.convert_expr(e)?);
+            // Substitutions convert via ToString(ToPrimitive(_, string)),
+            // which differs from the `+` operator's algorithm.
+            pieces.push(Expr::ToString(Box::new(self.convert_expr(e)?)));
             let q = t.quasis.get(i + 1).map(quasi_str).unwrap_or_default();
             pieces.push(Expr::Lit(Lit::String(Rc::from(q.as_str()))));
         }
@@ -434,7 +445,6 @@ impl Converter {
             ast::AssignmentTarget::ObjectAssignmentTarget(o) => {
                 Ok(AssignTarget::Pattern(self.convert_object_pattern_target(o)?))
             }
-            other => Err(Error::Parse(format!("unsupported assignment target (expr): {:?}", std::mem::discriminant(other)))),
         }
     }
 
@@ -508,6 +518,22 @@ impl Converter {
         let body = match &f.body {
             Some(b) => self.convert_stmts(&b.statements)?,
             None => Vec::new(),
+        };
+        // Generator/async functions are marked with wrapper statements; the
+        // function factory unwraps them and installs the behaviour.
+        // `async function*` (async generators) are parsed but explicitly
+        // unimplemented.
+        if f.generator && f.r#async {
+            return Err(Error::Unimplemented(
+                "async generators are not implemented".to_string(),
+            ));
+        }
+        let body = if f.generator {
+            vec![Stmt::GeneratorBody(body)]
+        } else if f.r#async {
+            vec![Stmt::AsyncBody(body)]
+        } else {
+            body
         };
         Ok((params, body))
     }

@@ -76,6 +76,7 @@ impl Value {
             Value::Set(_) => Rc::from("[object Set]"),
             Value::WeakMap(_) => Rc::from("[object WeakMap]"),
             Value::WeakSet(_) => Rc::from("[object WeakSet]"),
+            Value::Promise(_) => Rc::from("[object Promise]"),
             Value::Object(_) => Rc::from("[object Object]"),
             Value::Array(a) => {
                 let parts: Vec<String> =
@@ -97,6 +98,7 @@ impl Value {
             Value::String(_) => "string",
             Value::Symbol(_) => "symbol",
             Value::Map(_) | Value::Set(_) | Value::WeakMap(_) | Value::WeakSet(_) => "object",
+            Value::Promise(_) => "object",
             Value::Regex(_) => "object",
             Value::Object(_) | Value::Array(_) => "object",
             Value::Function(_) | Value::NativeFunction(_) => "function",
@@ -122,6 +124,7 @@ impl Value {
             (Value::Set(x), Value::Set(y)) => Rc::ptr_eq(x, y),
             (Value::WeakMap(x), Value::WeakMap(y)) => Rc::ptr_eq(x, y),
             (Value::WeakSet(x), Value::WeakSet(y)) => Rc::ptr_eq(x, y),
+            (Value::Promise(x), Value::Promise(y)) => Rc::ptr_eq(x, y),
             (Value::Undefined, Value::Undefined) => true,
             (Value::Null, Value::Null) => true,
             (Value::Boolean(x), Value::Boolean(y)) => x == y,
@@ -151,6 +154,7 @@ impl Value {
             (Value::Set(x), Value::Set(y)) => Rc::ptr_eq(x, y),
             (Value::WeakMap(x), Value::WeakMap(y)) => Rc::ptr_eq(x, y),
             (Value::WeakSet(x), Value::WeakSet(y)) => Rc::ptr_eq(x, y),
+            (Value::Promise(x), Value::Promise(y)) => Rc::ptr_eq(x, y),
             (Value::Undefined, Value::Undefined) => true,
             (Value::Null, Value::Null) => true,
             (Value::Boolean(x), Value::Boolean(y)) => x == y,

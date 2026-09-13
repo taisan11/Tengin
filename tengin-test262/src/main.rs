@@ -22,7 +22,8 @@
 //! (its thread is abandoned, not joined) and keeps holding its permit until it
 //! actually finishes, so at most `num_threads` such threads can accumulate.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -65,6 +66,28 @@ impl Semaphore {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Hidden worker mode used by the parent runner. Running one test in a
+    // child process gives the timeout watchdog a reliable way to terminate a
+    // runaway interpreter (Rust threads cannot be forcefully cancelled).
+    if let Some(i) = args.iter().position(|a| a == "--single") {
+        if let Some(path) = args.get(i + 1) {
+            let outcomes = run_test_file(Path::new(path));
+            let mut p = 0;
+            let mut f = 0;
+            let mut s = 0;
+            for outcome in outcomes {
+                match outcome.status {
+                    Status::Pass => p += 1,
+                    Status::Fail => f += 1,
+                    Status::Skip => s += 1,
+                }
+            }
+            // Encode the small per-file counts in the exit status so the
+            // parent never has to drain a potentially noisy stdout pipe.
+            std::process::exit(10 + p * 9 + f * 3 + s);
+        }
+    }
 
     let mut verbose = false;
     let mut test262_root = PathBuf::from("vendor/test262");
@@ -179,24 +202,13 @@ fn main() {
             let sem_for_timeout = sem.clone();
             let (tx, rx) = std::sync::mpsc::channel();
             sem.acquire();
-            // Give each test its own thread with a large stack: the interpreter
-            // is a tree-walker that recurses on the Rust call stack, so deeply
-            // (but legitimately) nested programs would otherwise overflow the
-            // default 2MB stack and abort the whole run.
+            // Give each test its own thread with a bounded large stack: the
+            // interpreter is a tree-walker that recurses on the Rust call
+            // stack, so deeply nested programs need more than the default 2MB.
             let worker = thread::Builder::new()
-                .stack_size(256 * 1024 * 1024)
+                .stack_size(16 * 1024 * 1024)
                 .spawn(move || {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run_test_file(&path_for_worker)
-                }));
-                let outcomes = result.unwrap_or_else(|_| {
-                    vec![TestOutcome {
-                        path: path_for_worker.to_string_lossy().to_string(),
-                        strict: false,
-                        status: Status::Fail,
-                        detail: "panic while running test".to_string(),
-                    }]
-                });
+                let outcomes = run_test_subprocess(&path_for_worker, timeout_secs);
                 let _ = tx.send(outcomes);
                 // Hand the permit back only once the test thread is done.
                 sem.release();
@@ -212,9 +224,9 @@ fn main() {
                 }
                 Err(_) => {
                     // Timed out. Detach the worker instead of joining it so we
-                    // never block on a hung test. Release the permit now so a
-                    // stream of timeouts cannot starve the whole run; the (late)
-                    // thread's eventual release is a harmless over-release.
+                    // never block on a hung test. Release the permit so later
+                    // tests can continue; the bounded stack limits detached
+                    // worker memory.
                     sem_for_timeout.release();
                     fail.fetch_add(1, Ordering::Relaxed);
                     if verbose {
@@ -291,4 +303,105 @@ fn main() {
             println!("{} ({mode}): {}", o.path, o.detail);
         }
     }
+}
+
+/// Execute one test in a child process and terminate it if it exceeds the
+/// configured timeout. This prevents detached interpreter threads from
+/// retaining unbounded heap graphs during a full-suite run.
+fn run_test_subprocess(path: &Path, timeout_secs: u64) -> Vec<TestOutcome> {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            return vec![TestOutcome {
+                path: path.to_string_lossy().to_string(),
+                strict: false,
+                status: Status::Fail,
+                detail: format!("cannot locate test runner: {e}"),
+            }]
+        }
+    };
+    let mut child = match Command::new(exe)
+        .arg("--single")
+        .arg(path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return vec![TestOutcome {
+                path: path.to_string_lossy().to_string(),
+                strict: false,
+                status: Status::Fail,
+                detail: format!("cannot spawn test runner: {e}"),
+            }]
+        }
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return vec![TestOutcome {
+                    path: path.to_string_lossy().to_string(),
+                    strict: false,
+                    status: Status::Fail,
+                    detail: "timeout".to_string(),
+                }];
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return vec![TestOutcome {
+                    path: path.to_string_lossy().to_string(),
+                    strict: false,
+                    status: Status::Fail,
+                    detail: format!("test runner wait failed: {e}"),
+                }];
+            }
+        }
+    };
+
+    let Some(code) = status.code().filter(|code| (10..=37).contains(code)) else {
+        return vec![TestOutcome {
+            path: path.to_string_lossy().to_string(),
+            strict: false,
+            status: Status::Fail,
+            detail: "test runner exited without a result".to_string(),
+        }];
+    };
+    let encoded = (code - 10) as usize;
+    let pass = encoded / 9;
+    let fail = (encoded % 9) / 3;
+    let skip = encoded % 3;
+    let mut outcomes = Vec::with_capacity(pass + fail + skip);
+    for _ in 0..pass {
+        outcomes.push(TestOutcome {
+            path: path.to_string_lossy().to_string(),
+            strict: false,
+            status: Status::Pass,
+            detail: String::new(),
+        });
+    }
+    for _ in 0..fail {
+        outcomes.push(TestOutcome {
+            path: path.to_string_lossy().to_string(),
+            strict: false,
+            status: Status::Fail,
+            detail: "failed in worker process".to_string(),
+        });
+    }
+    for _ in 0..skip {
+        outcomes.push(TestOutcome {
+            path: path.to_string_lossy().to_string(),
+            strict: false,
+            status: Status::Skip,
+            detail: String::new(),
+        });
+    }
+    outcomes
 }

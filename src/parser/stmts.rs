@@ -50,6 +50,11 @@ impl Converter {
                 })
             }
             ast::Statement::ForOfStatement(f) => {
+                if f.r#await {
+                    return Err(Error::Unimplemented(
+                        "for await...of is not implemented".to_string(),
+                    ));
+                }
                 let (name, kind) = self.convert_for_left(&f.left)?;
                 let expr = self.convert_expr(&f.right)?;
                 let body = self.stmt_to_vec(&f.body)?;
@@ -82,6 +87,29 @@ impl Converter {
                 })
             }
             ast::Statement::IfStatement(i) => {
+                // Early errors (13.6.1 / B.3.2): a function declaration may
+                // appear directly as an if body only in sloppy mode, and a
+                // *labelled* function declaration is never permitted there.
+                for arm in [Some(&i.consequent), i.alternate.as_ref()] {
+                    let Some(arm) = arm else { continue };
+                    match arm {
+                        ast::Statement::FunctionDeclaration(_) => {
+                            if self.strict {
+                                return Err(Error::Parse(
+                                    "function declaration is not allowed as the body of an if statement in strict mode"
+                                        .to_string(),
+                                ));
+                            }
+                        }
+                        s if Converter::is_labelled_function(s) => {
+                            return Err(Error::Parse(
+                                "labelled function declaration is not allowed as the body of an if statement"
+                                    .to_string(),
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
                 let cond = self.convert_expr(&i.test)?;
                 let then = self.stmt_to_vec(&i.consequent)?;
                 let else_ = match &i.alternate {
@@ -95,6 +123,7 @@ impl Converter {
                 None => None,
             })),
             ast::Statement::SwitchStatement(s) => {
+                self.check_switch_redeclarations(s)?;
                 let discriminant = self.convert_expr(&s.discriminant)?;
                 let mut cases = Vec::new();
                 for c in &s.cases {
@@ -245,7 +274,11 @@ impl Converter {
                 }
                 None => {
                     let (params, body) = self.convert_function(f)?;
-                    Ok(Stmt::Expr(Expr::Function { params, body }))
+                    Ok(Stmt::Expr(Expr::Function {
+                        name: None,
+                        params,
+                        body,
+                    }))
                 }
             },
             ast::ExportDefaultDeclarationKind::ClassDeclaration(c) => {
@@ -333,5 +366,215 @@ impl Converter {
             )),
             _ => Err(Error::Parse("unsupported for-in/of left side".to_string())),
         }
+    }
+
+    /// Early errors for a `switch` CaseBlock (13.12.8 + Annex B.3.3):
+    ///
+    /// - the lexically declared names (let/const/class/generator/async) of the
+    ///   CaseBlock must be unique, except that duplicate names bound *only* by
+    ///   plain function declarations are allowed in sloppy mode;
+    /// - no lexically declared name may also be a var-declared name of the
+    ///   CaseBlock. Function declaration names count as lexical for this rule
+    ///   in both modes.
+    pub(crate) fn check_switch_redeclarations(&mut self, s: &ast::SwitchStatement) -> Result<(), Error> {
+        let mut lexical: Vec<Rc<str>> = Vec::new();
+        let mut functions: Vec<Rc<str>> = Vec::new();
+        let mut vars: Vec<Rc<str>> = Vec::new();
+        for clause in &s.cases {
+            for stmt in &clause.consequent {
+                self.collect_clause_names(stmt, &mut lexical, &mut functions, &mut vars);
+            }
+        }
+        // Duplicate lexical bindings.
+        for names in [&lexical] {
+            for (i, n) in names.iter().enumerate() {
+                if names[..i].contains(n) {
+                    return Err(Error::Parse(format!(
+                        "lexical redeclaration in switch case block: '{n}'"
+                    )));
+                }
+            }
+        }
+        if self.strict {
+            // Function declarations are lexical in strict mode: any duplicate
+            // among them is an error.
+            for (i, n) in functions.iter().enumerate() {
+                if functions[..i].contains(n) {
+                    return Err(Error::Parse(format!(
+                        "lexical redeclaration in switch case block: '{n}'"
+                    )));
+                }
+            }
+        }
+        // A lexical name may not collide with a function declaration name
+        // (the sloppy exception covers function/function pairs only).
+        for f in &functions {
+            if lexical.contains(f) {
+                return Err(Error::Parse(format!(
+                    "redeclaration of '{f}' in switch case block"
+                )));
+            }
+        }
+        // Lexical (incl. function) names may not collide with var names.
+        for v in &vars {
+            if lexical.contains(v) || functions.contains(v) {
+                return Err(Error::Parse(format!(
+                    "redeclaration of '{v}' in switch case block"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Collect the names declared by a statement in the *top level* of a case
+    /// clause: `lexical` gathers let/const/class/generator/async-function
+    /// bindings, `functions` plain function declarations, and `vars` all
+    /// `var`-declared names (recursing into nested statements, but never into
+    /// function bodies).
+    fn collect_clause_names(
+        &mut self,
+        stmt: &ast::Statement,
+        lexical: &mut Vec<Rc<str>>,
+        functions: &mut Vec<Rc<str>>,
+        vars: &mut Vec<Rc<str>>,
+    ) {
+        use ast::Statement as S;
+        match stmt {
+            S::VariableDeclaration(v) => {
+                for d in &v.declarations {
+                    let out: &mut Vec<Rc<str>> = match v.kind {
+                        ast::VariableDeclarationKind::Var => vars,
+                        ast::VariableDeclarationKind::Let
+                        | ast::VariableDeclarationKind::Const
+                        | ast::VariableDeclarationKind::Using
+                        | ast::VariableDeclarationKind::AwaitUsing => lexical,
+                    };
+                    collect_pattern_idents(&d.id, out);
+                }
+            }
+            S::FunctionDeclaration(f) => {
+                if let Some(id) = &f.id {
+                    let name = Rc::from(id.name.as_str());
+                    if f.generator || f.r#async {
+                        lexical.push(name);
+                    } else {
+                        functions.push(name);
+                    }
+                }
+            }
+            S::ClassDeclaration(c) => {
+                if let Some(id) = &c.id {
+                    lexical.push(Rc::from(id.name.as_str()));
+                }
+            }
+            // `var` declarations are hoisted out of every nested construct;
+            // only top-level lexical/function declarations belong to the
+            // CaseBlock, so nested statements only contribute `var` names.
+            S::BlockStatement(b) => {
+                for s in &b.body {
+                    self.collect_var_names(s, vars);
+                }
+            }
+            S::IfStatement(i) => {
+                self.collect_var_names(&i.consequent, vars);
+                if let Some(a) = &i.alternate {
+                    self.collect_var_names(a, vars);
+                }
+            }
+            S::ForStatement(f) => {
+                if let Some(init) = &f.init {
+                    if let ast::ForStatementInit::VariableDeclaration(v) = init {
+                        if matches!(v.kind, ast::VariableDeclarationKind::Var) {
+                            for d in &v.declarations {
+                                collect_pattern_idents(&d.id, vars);
+                            }
+                        }
+                    }
+                }
+                self.collect_var_names(&f.body, vars);
+            }
+            S::ForInStatement(f) => {
+                self.collect_for_left_names(&f.left, vars);
+                self.collect_var_names(&f.body, vars);
+            }
+            S::ForOfStatement(f) => {
+                self.collect_for_left_names(&f.left, vars);
+                self.collect_var_names(&f.body, vars);
+            }
+            S::WhileStatement(w) => self.collect_var_names(&w.body, vars),
+            S::DoWhileStatement(d) => self.collect_var_names(&d.body, vars),
+            S::TryStatement(t) => {
+                for s in &t.block.body {
+                    self.collect_var_names(s, vars);
+                }
+                if let Some(h) = &t.handler {
+                    for s in &h.body.body {
+                        self.collect_var_names(s, vars);
+                    }
+                }
+                if let Some(fi) = &t.finalizer {
+                    for s in &fi.body {
+                        self.collect_var_names(s, vars);
+                    }
+                }
+            }
+            S::SwitchStatement(sw) => {
+                for c in &sw.cases {
+                    for s in &c.consequent {
+                        self.collect_var_names(s, vars);
+                    }
+                }
+            }
+            S::LabeledStatement(l) => {
+                // `var` hoists out of labels; lexical/function declarations at
+                // clause top level are unaffected by a leading label.
+                self.collect_var_names(&l.body, vars);
+            }
+            S::WithStatement(w) => self.collect_var_names(&w.body, vars),
+            _ => {}
+        }
+    }
+
+    /// Var-only recursion used inside nested statements.
+    fn collect_var_names(&mut self, stmt: &ast::Statement, vars: &mut Vec<Rc<str>>) {
+        let mut lexical = Vec::new();
+        let mut functions = Vec::new();
+        self.collect_clause_names(stmt, &mut lexical, &mut functions, vars);
+    }
+
+    fn collect_for_left_names(&mut self, left: &ast::ForStatementLeft, vars: &mut Vec<Rc<str>>) {
+        if let ast::ForStatementLeft::VariableDeclaration(v) = left {
+            if matches!(v.kind, ast::VariableDeclarationKind::Var) {
+                for d in &v.declarations {
+                    collect_pattern_idents(&d.id, vars);
+                }
+            }
+        }
+    }
+}
+
+/// Collect every identifier bound by a binding pattern.
+fn collect_pattern_idents(pat: &ast::BindingPattern, out: &mut Vec<Rc<str>>) {
+    match pat {
+        ast::BindingPattern::BindingIdentifier(id) => {
+            out.push(Rc::from(id.name.as_str()));
+        }
+        ast::BindingPattern::ObjectPattern(o) => {
+            for p in &o.properties {
+                collect_pattern_idents(&p.value, out);
+            }
+            if let Some(r) = &o.rest {
+                collect_pattern_idents(&r.argument, out);
+            }
+        }
+        ast::BindingPattern::ArrayPattern(a) => {
+            for el in a.elements.iter().flatten() {
+                collect_pattern_idents(el, out);
+            }
+            if let Some(r) = &a.rest {
+                collect_pattern_idents(&r.argument, out);
+            }
+        }
+        ast::BindingPattern::AssignmentPattern(a) => collect_pattern_idents(&a.left, out),
     }
 }

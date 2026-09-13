@@ -10,8 +10,8 @@ use std::collections::HashSet;
 
 use crate::environment::Env;
 use crate::value::{
-    ArrayData, Function, MapData, NativeFunctionData, Object, SetData, Value, WeakMapData,
-    WeakSetData,
+    ArrayData, Function, MapData, NativeFunctionData, Object, PromiseData, SetData, Value,
+    WeakMapData, WeakSetData,
 };
 
 use super::Engine;
@@ -42,6 +42,7 @@ pub(crate) struct GcHeap {
     pub weakmaps: Vec<Weak<RefCell<WeakMapData>>>,
     #[allow(dead_code)]
     pub weaksets: Vec<Weak<RefCell<WeakSetData>>>,
+    pub promises: Vec<Weak<RefCell<PromiseData>>>,
 }
 
 pub(crate) const GC_THRESHOLD: usize = 4096;
@@ -139,9 +140,48 @@ impl Engine {
         values.push(Value::Object(self.weakmap_prototype.clone()));
         values.push(Value::Object(self.weakset_prototype.clone()));
         values.push(Value::Object(self.regexp_prototype.clone()));
+        values.push(Value::Object(self.promise_prototype.clone()));
+        values.push(Value::Object(self.async_function_prototype.clone()));
         envs.push(self.global_env.clone());
         if let Some(v) = extra {
             values.push(v.clone());
+        }
+        // Jobs and unhandled rejections keep their promises/values alive.
+        for job in self.job_queue.borrow().iter() {
+            match job {
+                super::jobs::Job::Reaction { reaction, settlement } => {
+                    values.push(Value::Promise(reaction.promise.clone()));
+                    if let Some(f) = reaction.on_fulfilled.clone() {
+                        values.push(f);
+                    }
+                    if let Some(f) = reaction.on_rejected.clone() {
+                        values.push(f);
+                    }
+                    mark_settlement(settlement, &mut values);
+                }
+                super::jobs::Job::AsyncResume { capability, settlement, .. } => {
+                    values.push(Value::Promise(capability.clone()));
+                    mark_settlement(settlement, &mut values);
+                }
+                super::jobs::Job::Thenable { then, thenable, capability } => {
+                    values.push(then.clone());
+                    values.push(thenable.clone());
+                    values.push(Value::Promise(capability.clone()));
+                }
+                super::jobs::Job::Microtask { callback } => {
+                    values.push(callback.clone());
+                }
+            }
+        }
+        for v in self.unhandled.borrow().iter() {
+            values.push(v.clone());
+        }
+        // Timers keep their callbacks/args alive.
+        for t in self.timers.borrow().iter() {
+            values.push(t.callback.clone());
+            for a in t.args.iter() {
+                values.push(a.clone());
+            }
         }
 
         while let Some(v) = values.pop() {
@@ -259,6 +299,24 @@ impl Engine {
         }
         gc.weaksets = keep;
 
+        let promises = core::mem::take(&mut gc.promises);
+        let mut keep = Vec::with_capacity(promises.len());
+        for w in promises {
+            if let Some(p) = w.upgrade() {
+                if marked.contains(&(Rc::as_ptr(&p) as *const ())) {
+                    keep.push(Rc::downgrade(&p));
+                } else {
+                    let mut b = p.borrow_mut();
+                    b.props.clear();
+                    b.proto = None;
+                    if let crate::value::PromiseState::Pending { reactions } = &mut b.state {
+                        reactions.clear();
+                    }
+                }
+            }
+        }
+        gc.promises = keep;
+
         // Environments are kept alive strongly by closures; break their variable
         // bindings when unreachable so closure/environment cycles collapse.
         let envs = core::mem::take(&mut gc.envs);
@@ -374,7 +432,79 @@ fn mark_value(v: &Value, marked: &mut HashSet<*const ()>, values: &mut Vec<Value
                 // No strong references are kept.
             }
         }
+        Value::Promise(p) => {
+            if marked.insert(Rc::as_ptr(p) as *const ()) {
+                let g = p.borrow();
+                for prop in g.props.values() {
+                    values.push(prop.value.clone());
+                }
+                if let Some(pr) = &g.proto {
+                    values.push(Value::Object(pr.clone()));
+                }
+                // Reaction-held values (handlers, capabilities, aggregate
+                // slots, finally payloads) keep their graph alive. Suspended
+                // `await` continuations are opaque here, but no collection
+                // runs mid-drain while they exist (see `drain_jobs`).
+                match &g.state {
+                    crate::value::PromiseState::Pending { reactions } => {
+                        for r in reactions {
+                            values.push(Value::Promise(r.promise.clone()));
+                            if let Some(f) = r.on_fulfilled.clone() {
+                                values.push(f);
+                            }
+                            if let Some(f) = r.on_rejected.clone() {
+                                values.push(f);
+                            }
+                            match &r.kind {
+                                crate::value::PromiseReactionKind::AllElement { shared, .. } => {
+                                    for slot in shared.borrow().results.iter().flatten() {
+                                        values.push(slot.clone());
+                                    }
+                                }
+                                crate::value::PromiseReactionKind::AllSettled { shared, .. } => {
+                                    for slot in shared.borrow().results.iter().flatten() {
+                                        values.push(slot.clone());
+                                    }
+                                }
+                                crate::value::PromiseReactionKind::FinallyCall { cb } => {
+                                    values.push(cb.clone());
+                                }
+                                crate::value::PromiseReactionKind::Any { holder, .. } => {
+                                    values.push(holder.clone());
+                                }
+                                crate::value::PromiseReactionKind::Custom {
+                                    promise,
+                                    resolve,
+                                    reject,
+                                } => {
+                                    values.push(promise.clone());
+                                    values.push(resolve.clone());
+                                    values.push(reject.clone());
+                                }
+                                crate::value::PromiseReactionKind::FinallyPropagate { original } => {
+                                    mark_settlement(original, values);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    crate::value::PromiseState::Fulfilled(v) => values.push(v.clone()),
+                    crate::value::PromiseState::Rejected(e) => values.push(e.clone()),
+                }
+            }
+        }
         _ => {}
+    }
+}
+
+/// Push a [`Settlement`](crate::error::Settlement)'s value for marking.
+fn mark_settlement(
+    s: &crate::error::Settlement,
+    values: &mut Vec<Value>,
+) {
+    match s {
+        crate::error::Settlement::Fulfilled(v) => values.push(v.clone()),
+        crate::error::Settlement::Rejected(e) => values.push(e.clone()),
     }
 }
 

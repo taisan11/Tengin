@@ -1,0 +1,111 @@
+name: Full test262
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Do not let two manual runs race while committing the same log file.
+concurrency:
+  group: test262-full
+  cancel-in-progress: false
+
+jobs:
+  test262:
+    runs-on: ubuntu-latest
+    # A full test262 run can be lengthy, but the per-test timeout in the
+    # runner prevents an individual test from hanging indefinitely.
+    timeout-minutes: 360
+
+    steps:
+      - name: Check out repository and test262
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Start run log
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p test262-logs
+          {
+            echo "Full test262 run"
+            echo "run_id: ${GITHUB_RUN_ID}"
+            echo "run_number: ${GITHUB_RUN_NUMBER}"
+            echo "sha: ${GITHUB_SHA}"
+            echo "started_at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo
+          } > test262-logs/latest.log
+
+      - name: Build workspace
+        id: build
+        shell: bash
+        run: |
+          set +e
+          {
+            echo "=== cargo build --workspace --release ==="
+            cargo build --workspace --release
+            status=$?
+            echo "build_exit_code: ${status}"
+            exit "${status}"
+          } 2>&1 | tee -a test262-logs/latest.log
+          status=${PIPESTATUS[0]}
+          set -e
+          exit "${status}"
+
+      - name: Run the full test262 suite
+        if: steps.build.outcome == 'success'
+        continue-on-error: true
+        # Leave time for the final log commit even if the suite reaches the
+        # GitHub Actions job limit.
+        timeout-minutes: 350
+        shell: bash
+        run: |
+          set +e
+          {
+            echo
+            echo "=== tengin-test262 (full suite) ==="
+            echo "command: target/release/tengin-test262 --timeout 60"
+            ./target/release/tengin-test262 --timeout 60
+            status=$?
+            echo "test262_exit_code: ${status}"
+            exit "${status}"
+          } 2>&1 | tee -a test262-logs/latest.log
+          status=${PIPESTATUS[0]}
+          set -e
+          exit "${status}"
+
+      - name: Finish run log
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo
+            echo "finished_at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } >> test262-logs/latest.log
+
+      - name: Commit and push the log
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! -f test262-logs/latest.log ]]; then
+            echo "No run log was created; nothing to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add test262-logs/latest.log
+
+          if git diff --cached --quiet; then
+            echo "No log changes to commit."
+            exit 0
+          fi
+
+          git commit -m "ci: update full test262 log [skip ci]"
+          git push origin "HEAD:${GITHUB_REF_NAME}"

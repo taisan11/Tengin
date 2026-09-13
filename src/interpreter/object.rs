@@ -15,6 +15,17 @@ use crate::value::{CtorRef, Object, Property, SymbolData, Value};
 use super::ops::symbol_iterator_id;
 use super::Engine;
 
+/// The `ToPrimitive` preferred-type hint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrimitiveHint {
+    /// No preference (binary `+`, template literals, `==`).
+    Default,
+    /// Numeric contexts (`ToNumber` and friends).
+    Number,
+    /// String contexts (`ToString`, computed property keys).
+    String,
+}
+
 impl Engine {
     /// Upgrade a weak constructor back-reference into a usable value.
     fn resolve_ctor(ctor: &Option<CtorRef>) -> Option<Value> {
@@ -105,8 +116,16 @@ impl Engine {
                 return self.lookup_proto(&self.array_prototype, key);
             }
             Value::Function(f) => {
-                if let Some(p) = f.borrow().props.get(key) {
-                    return p.value.clone();
+                if let Some(p) = f.borrow().props.get(key).cloned() {
+                    if p.is_accessor() {
+                        if let Some(g) = p.get {
+                            return self
+                                .call_function(&g, base, &[])
+                                .unwrap_or(Value::Undefined);
+                        }
+                        return Value::Undefined;
+                    }
+                    return p.value;
                 }
                 let mut cur = f.borrow().proto.clone();
                 while let Some(c) = cur {
@@ -127,6 +146,23 @@ impl Engine {
                         }
                     }
                     cur = c.borrow().proto.clone();
+                }
+                // Static inheritance: a derived class constructor falls back
+                // to its parent constructor (`super_ctor` chain). Accessors
+                // run with the original receiver (`base`).
+                if let Some(sup) = f.borrow().super_ctor.clone() {
+                    match self.get_raw_property(&sup, key) {
+                        Some(p) if p.is_accessor() => {
+                            if let Some(g) = p.get {
+                                return self
+                                    .call_function(&g, base, &[])
+                                    .unwrap_or(Value::Undefined);
+                            }
+                            return Value::Undefined;
+                        }
+                        Some(p) => return p.value,
+                        None => {}
+                    }
                 }
                 Value::Undefined
             }
@@ -167,6 +203,24 @@ impl Engine {
                 }
                 Value::Undefined
             }
+            Value::BigInt(s) => {
+                let mut cur = Some(self.bigint_prototype.clone());
+                while let Some(c) = cur {
+                    if let Some(p) = c.borrow().props.get(key) {
+                        if p.is_accessor() {
+                            if let Some(g) = &p.get {
+                                return self
+                                    .call_function(g, &Value::BigInt(s.clone()), &[])
+                                    .unwrap_or(Value::Undefined);
+                            }
+                            return Value::Undefined;
+                        }
+                        return p.value.clone();
+                    }
+                    cur = c.borrow().proto.clone();
+                }
+                Value::Undefined
+            }
             Value::Regex(rx) => {
                 if key == "lastIndex" {
                     return Value::Number(*rx.last_index.borrow() as f64);
@@ -175,6 +229,13 @@ impl Engine {
             }
             Value::Map(m) => self.get_via_proto(Some(self.map_prototype.clone()), key, &Value::Map(m.clone())),
             Value::Set(s) => self.get_via_proto(Some(self.set_prototype.clone()), key, &Value::Set(s.clone())),
+            Value::Promise(p) => {
+                if let Some(prop) = p.borrow().props.get(key) {
+                    return prop.value.clone();
+                }
+                let start = p.borrow().proto.clone().or_else(|| Some(self.promise_prototype.clone()));
+                self.get_via_proto(start, key, &Value::Promise(p.clone()))
+            }
             Value::WeakMap(w) => {
                 self.get_via_proto(Some(self.weakmap_prototype.clone()), key, &Value::WeakMap(w.clone()))
             }
@@ -182,8 +243,16 @@ impl Engine {
                 self.get_via_proto(Some(self.weakset_prototype.clone()), key, &Value::WeakSet(w.clone()))
             }
             Value::NativeFunction(nf) => {
-                if let Some(p) = nf.borrow().props.get(key) {
-                    return p.value.clone();
+                if let Some(p) = nf.borrow().props.get(key).cloned() {
+                    if p.is_accessor() {
+                        if let Some(g) = p.get {
+                            return self
+                                .call_function(&g, base, &[])
+                                .unwrap_or(Value::Undefined);
+                        }
+                        return Value::Undefined;
+                    }
+                    return p.value;
                 }
                 // A native function (e.g. a builtin prototype method) may have no
                 // explicit prototype; fall back to `Function.prototype` so that
@@ -256,6 +325,92 @@ impl Engine {
         Value::Undefined
     }
 
+    /// Raw (getter-preserving) property lookup: walk own + prototype chain
+    /// returning the stored [`Property`] without invoking accessors. Used by
+    /// thenable assimilation, where a throwing `then` getter must reject
+    /// rather than be swallowed.
+    pub(crate) fn get_raw_property(&self, base: &Value, key: &str) -> Option<Property> {
+        fn walk(start: Option<Rc<RefCell<Object>>>, key: &str) -> Option<Property> {
+            let mut cur = start;
+            while let Some(c) = cur {
+                if let Some(p) = c.borrow().props.get(key).cloned() {
+                    return Some(p);
+                }
+                cur = c.borrow().proto.clone();
+            }
+            None
+        }
+        match base {
+            Value::Object(o) => walk(Some(o.clone()), key),
+            Value::Array(a) => a
+                .borrow()
+                .props
+                .get(key)
+                .cloned()
+                .or_else(|| walk(Some(self.array_prototype.clone()), key)),
+            Value::Function(f) => f
+                .borrow()
+                .props
+                .get(key)
+                .cloned()
+                .or_else(|| {
+                    walk(
+                        f.borrow()
+                            .proto
+                            .clone()
+                            .or_else(|| Some(self.function_prototype.clone())),
+                        key,
+                    )
+                })
+                .or_else(|| {
+                    // Static inheritance via the parent constructor.
+                    f.borrow()
+                        .super_ctor
+                        .clone()
+                        .and_then(|sup| self.get_raw_property(&sup, key))
+                }),
+            Value::NativeFunction(nf) => nf
+                .borrow()
+                .props
+                .get(key)
+                .cloned()
+                .or_else(|| {
+                    walk(
+                        nf.borrow()
+                            .proto
+                            .clone()
+                            .or_else(|| Some(self.function_prototype.clone())),
+                        key,
+                    )
+                }),
+            Value::Promise(p) => p
+                .borrow()
+                .props
+                .get(key)
+                .cloned()
+                .or_else(|| {
+                    walk(
+                        p.borrow()
+                            .proto
+                            .clone()
+                            .or_else(|| Some(self.promise_prototype.clone())),
+                        key,
+                    )
+                }),
+            Value::String(_) => walk(Some(self.string_prototype.clone()), key),
+            Value::Number(_) => walk(Some(self.number_prototype.clone()), key),
+            Value::Boolean(_) => walk(Some(self.boolean_prototype.clone()), key),
+            Value::Symbol(_) => walk(Some(self.symbol_prototype.clone()), key),
+            Value::BigInt(_) => walk(Some(self.bigint_prototype.clone()), key),
+            Value::Regex(_) => walk(Some(self.regexp_prototype.clone()), key),
+            Value::Map(_) => walk(Some(self.map_prototype.clone()), key),
+            Value::Set(_) => walk(Some(self.set_prototype.clone()), key),
+            Value::WeakMap(_) => walk(Some(self.weakmap_prototype.clone()), key),
+            Value::WeakSet(_) => walk(Some(self.weakset_prototype.clone()), key),
+            Value::Undefined | Value::Null => None,
+        }
+    }
+
     /// If `this` is a primitive wrapper object, return the wrapped primitive;
     /// otherwise return `this` unchanged.
     pub(crate) fn this_primitive(&self, this: &Value) -> Value {
@@ -311,6 +466,15 @@ impl Engine {
     /// Produce an indexed (array-like) sequence of values for `for…of` and
     /// array destructuring.
     pub(crate) fn iterable_values(&self, base: &Value) -> Result<Vec<Value>> {
+        // An explicit (or inherited) `Symbol.iterator` takes precedence over
+        // the built-in fast paths, per GetIterator.
+        if Self::is_object_value(base) {
+            let iter_key = symbol_iterator_id();
+            let iter_fn = self.get_property(base, &iter_key);
+            if Self::is_callable_value(&iter_fn) {
+                return self.iterate_protocol(base);
+            }
+        }
         match base {
             Value::Array(a) => Ok(a.borrow().elems.clone()),
             Value::String(s) => {
@@ -350,9 +514,7 @@ impl Engine {
                     }
                     Ok(v)
                 } else {
-                    Err(Error::Runtime(Value::String(Rc::from(
-                        "TypeError: not iterable",
-                    ))))
+                    Err(Error::Runtime(self.make_type_error("value is not iterable")))
                 }
             }
         }
@@ -555,6 +717,9 @@ impl Engine {
                     *rx.last_index.borrow_mut() = c;
                 }
             }
+            Value::Promise(p) => {
+                p.borrow_mut().props.insert(Rc::from(key), Property::new(val));
+            }
             _ => {}
         }
         Ok(())
@@ -571,6 +736,7 @@ impl Engine {
             }
             Value::Function(f) => f.borrow().props.contains_key(key),
             Value::NativeFunction(nf) => nf.borrow().props.contains_key(key),
+            Value::Promise(p) => p.borrow().props.contains_key(key),
             Value::String(s) => key == "length" || key.parse::<usize>().map(|i| i < s.chars().count()).unwrap_or(false),
             _ => false,
         }
@@ -590,6 +756,7 @@ impl Engine {
             Value::String(_) => Some(false),
             Value::Function(f) => f.borrow().props.get(key).map(|p| p.enumerable),
             Value::NativeFunction(nf) => nf.borrow().props.get(key).map(|p| p.enumerable),
+            Value::Promise(p) => p.borrow().props.get(key).map(|p| p.enumerable),
             _ => None,
         }
     }
@@ -601,6 +768,7 @@ impl Engine {
             Value::Array(a) => a.borrow().props.get(key).cloned(),
             Value::Function(f) => f.borrow().props.get(key).cloned(),
             Value::NativeFunction(nf) => nf.borrow().props.get(key).cloned(),
+            Value::Promise(p) => p.borrow().props.get(key).cloned(),
             _ => None,
         }
     }
@@ -695,6 +863,9 @@ impl Engine {
                     a.borrow_mut().props.insert(Rc::from(key), prop);
                 }
             }
+            Value::Promise(p) => {
+                p.borrow_mut().props.insert(Rc::from(key), prop);
+            }
             _ => {}
         }
     }
@@ -755,7 +926,7 @@ impl Engine {
         match base {
             Value::Object(o) => {
                 for k in o.borrow().props.keys() {
-                    if k.as_ref() != "__value__" {
+                    if k.as_ref() != "__value__" && k.as_ref() != "__error_data__" {
                         names.push(k.clone());
                     }
                 }
@@ -767,7 +938,7 @@ impl Engine {
                 }
                 let b = a.borrow();
                 for k in b.props.keys() {
-                    if k.as_ref() != "__value__" {
+                    if k.as_ref() != "__value__" && k.as_ref() != "__error_data__" {
                         names.push(k.clone());
                     }
                 }
@@ -780,16 +951,21 @@ impl Engine {
             }
             Value::Function(f) => {
                 for k in f.borrow().props.keys() {
-                    if k.as_ref() != "__value__" {
+                    if k.as_ref() != "__value__" && k.as_ref() != "__error_data__" {
                         names.push(k.clone());
                     }
                 }
             }
             Value::NativeFunction(nf) => {
                 for k in nf.borrow().props.keys() {
-                    if k.as_ref() != "__value__" {
+                    if k.as_ref() != "__value__" && k.as_ref() != "__error_data__" {
                         names.push(k.clone());
                     }
+                }
+            }
+            Value::Promise(p) => {
+                for k in p.borrow().props.keys() {
+                    names.push(k.clone());
                 }
             }
             _ => {}
@@ -842,6 +1018,7 @@ impl Engine {
                 | Value::Set(_)
                 | Value::WeakMap(_)
                 | Value::WeakSet(_)
+                | Value::Promise(_)
         )
     }
 
@@ -858,13 +1035,50 @@ impl Engine {
     /// objects a `TypeError` is thrown. Errors thrown by the user methods are
     /// propagated.
     pub(crate) fn to_primitive(&self, v: &Value, hint_string: bool) -> Result<Value> {
+        let hint = if hint_string {
+            PrimitiveHint::String
+        } else {
+            PrimitiveHint::Number
+        };
+        self.to_primitive_hint(v, hint)
+    }
+
+    /// ECMAScript `ToPrimitive` with a full three-way hint (including the
+    /// no-preference `Default` hint used by `+`). A `Symbol.toPrimitive`
+    /// method, when present and callable, takes precedence over the ordinary
+    /// `valueOf`/`toString` algorithm.
+    pub(crate) fn to_primitive_hint(&self, v: &Value, hint: PrimitiveHint) -> Result<Value> {
         if !Self::is_object_value(v) {
             return Ok(v.clone());
         }
-        let (first, second) = if hint_string {
-            ("toString", "valueOf")
+        let hint_str = match hint {
+            PrimitiveHint::Default => "default",
+            PrimitiveHint::Number => "number",
+            PrimitiveHint::String => "string",
+        };
+        let exotic_key = crate::value::SymbolData::well_known_key("toPrimitive");
+        let exotic = self.get_property(v, exotic_key.as_ref());
+        if matches!(exotic, Value::Undefined | Value::Null) {
+            // No @@toPrimitive method: fall through to the ordinary algorithm.
+        } else if Self::is_callable_value(&exotic) {
+            let r = self.call_value(&exotic, v, &[Value::String(Rc::from(hint_str))])?;
+            if !Self::is_object_value(&r) {
+                return Ok(r);
+            }
+            return Err(self.type_error("Cannot convert object to primitive value"));
         } else {
+            return Err(self.type_error("Symbol.toPrimitive is not callable"));
+        }
+        self.ordinary_to_primitive(v, hint != PrimitiveHint::String)
+    }
+
+    /// ECMAScript `OrdinaryToPrimitive`: try `valueOf` then `toString`
+    /// (number-ish hint) or the reverse (string hint).
+    fn ordinary_to_primitive(&self, v: &Value, hint_number: bool) -> Result<Value> {
+        let (first, second) = if hint_number {
             ("valueOf", "toString")
+        } else {
+            ("toString", "valueOf")
         };
         let first_fn = self.get_property(v, first);
         if Self::is_callable_value(&first_fn) {
@@ -913,13 +1127,47 @@ impl Engine {
         }
     }
 
+    /// ECMAScript `ToString` that can fail: runs `ToPrimitive` (string hint) —
+    /// user `toString`/`valueOf` may throw — and rejects `Symbol`s.
+    pub(crate) fn to_string_fallible(&self, v: &Value) -> Result<Rc<str>> {
+        let prim = self.to_primitive(v, true)?;
+        if matches!(prim, Value::Symbol(_)) {
+            return Err(self.type_error("Cannot convert a Symbol to a string"));
+        }
+        Ok(prim.to_string())
+    }
+
     /// Create a brand-new error object whose prototype is `proto`.
     fn make_error(&self, proto: &Rc<RefCell<Object>>, name: &str, msg: &str) -> Value {
         let obj = self.make_object(proto.clone());
         {
             let mut b = obj.borrow_mut();
-            b.props.insert(Rc::from("name"), Property::new(Value::String(Rc::from(name))));
-            b.props.insert(Rc::from("message"), Property::new(Value::String(Rc::from(msg))));
+            b.props.insert(
+                Rc::from("__error_data__"),
+                Property::new(Value::Boolean(true)),
+            );
+            b.props.insert(
+                Rc::from("name"),
+                Property {
+                    value: Value::String(Rc::from(name)),
+                    writable: true,
+                    enumerable: false,
+                    configurable: true,
+                    get: None,
+                    set: None,
+                },
+            );
+            b.props.insert(
+                Rc::from("message"),
+                Property {
+                    value: Value::String(Rc::from(msg)),
+                    writable: true,
+                    enumerable: false,
+                    configurable: true,
+                    get: None,
+                    set: None,
+                },
+            );
         }
         Value::Object(obj)
     }

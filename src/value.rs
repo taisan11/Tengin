@@ -15,6 +15,12 @@ pub enum RealmProto {
     Number,
     String,
     Boolean,
+    /// `%Promise.prototype%`.
+    Promise,
+    /// `%Error.prototype%`.
+    Error,
+    /// A `NativeError.prototype%` (e.g. `"EvalError"`).
+    NativeError(&'static str),
 }
 
 /// Per-realm intrinsic objects. Each `Engine` is its own realm; a real cross-
@@ -26,9 +32,26 @@ pub struct RealmInfo {
     pub number_prototype: Rc<RefCell<Object>>,
     pub string_prototype: Rc<RefCell<Object>>,
     pub boolean_prototype: Rc<RefCell<Object>>,
+    pub promise_prototype: Rc<RefCell<Object>>,
+    /// The realm's `Error`/`NativeError` prototypes by constructor name.
+    pub error_prototypes: Vec<(&'static str, Rc<RefCell<Object>>)>,
+}
+
+impl RealmInfo {
+    /// The realm's intrinsic prototype for an error constructor name.
+    pub fn error_prototype_for(&self, name: &str) -> Option<Rc<RefCell<Object>>> {
+        self.error_prototypes
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, p)| p.clone())
+    }
 }
 /// A JavaScript value, restricted to the subset supported by the engine so far.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is cycle-safe: heap graphs routinely contain reference cycles
+/// (`ctor.prototype.constructor`), so nested values/objects past a small
+/// depth render as `…` instead of recursing forever.
+#[derive(Clone)]
 pub enum Value {
     Undefined,
     Null,
@@ -55,6 +78,189 @@ pub enum Value {
     WeakMap(Rc<RefCell<WeakMapData>>),
     /// A `WeakSet` instance.
     WeakSet(Rc<RefCell<WeakSetData>>),
+    /// A `Promise` instance.
+    Promise(Rc<RefCell<PromiseData>>),
+}
+
+/// State of a `Promise` instance.
+#[derive(Debug, Clone)]
+pub enum PromiseState {
+    /// Still pending; `reactions` are settled (in registration order) when the
+    /// promise settles.
+    Pending { reactions: Vec<PromiseReaction> },
+    Fulfilled(Value),
+    Rejected(Value),
+}
+
+/// Internal flavour of a promise reaction. `Then` is the ordinary `.then`
+/// case; the rest are engine-internal (`await`, `Promise.all`, `finally`,
+/// promise adoption) and carry their state directly so no JS-visible closure
+/// values are needed.
+pub enum PromiseReactionKind {
+    /// Ordinary `.then(onF, onR)`; handlers live on the reaction itself.
+    Then,
+    /// Adopt another promise's settlement into the dependent promise.
+    Forward,
+    /// Suspended `await` continuation.
+    Async { cont: crate::error::SuspendCont },
+    /// One element of `Promise.all`: writes into shared slot `index`.
+    AllElement {
+        index: usize,
+        shared: Rc<RefCell<AllState>>,
+    },
+    /// One element of `Promise.any`: fulfillment settles the aggregate
+    /// immediately; rejections accumulate into the shared holder object
+    /// (`{ remaining, errors }`) until the last one rejects the aggregate.
+    Any { holder: Value, index: usize },
+    /// One element of `Promise.allSettled`: records its outcome object.
+    AllSettled {
+        index: usize,
+        shared: Rc<RefCell<AllSettledState>>,
+    },
+    /// Settle a custom-constructor capability by calling its recorded
+    /// `resolve`/`reject` functions (used for species-derived promises).
+    Custom {
+        promise: Value,
+        resolve: Value,
+        reject: Value,
+    },
+    /// First stage of `finally(cb)`: call `cb`, then propagate `original`.
+    FinallyCall { cb: Value },
+    /// Second stage of `finally`: `cb` fulfilled, settle with `original`.
+    FinallyPropagate { original: crate::error::Settlement },
+}
+
+impl Clone for PromiseReactionKind {
+    fn clone(&self) -> Self {
+        match self {
+            PromiseReactionKind::Then => PromiseReactionKind::Then,
+            PromiseReactionKind::Forward => PromiseReactionKind::Forward,
+            PromiseReactionKind::Async { cont } => {
+                PromiseReactionKind::Async { cont: cont.clone() }
+            }
+            PromiseReactionKind::AllElement { index, shared } => {
+                PromiseReactionKind::AllElement {
+                    index: *index,
+                    shared: shared.clone(),
+                }
+            }
+            PromiseReactionKind::Any { holder, index } => PromiseReactionKind::Any {
+                holder: holder.clone(),
+                index: *index,
+            },
+            PromiseReactionKind::AllSettled { index, shared } => {
+                PromiseReactionKind::AllSettled {
+                    index: *index,
+                    shared: shared.clone(),
+                }
+            }
+            PromiseReactionKind::Custom {
+                promise,
+                resolve,
+                reject,
+            } => PromiseReactionKind::Custom {
+                promise: promise.clone(),
+                resolve: resolve.clone(),
+                reject: reject.clone(),
+            },
+            PromiseReactionKind::FinallyCall { cb } => {
+                PromiseReactionKind::FinallyCall { cb: cb.clone() }
+            }
+            PromiseReactionKind::FinallyPropagate { original } => {
+                PromiseReactionKind::FinallyPropagate {
+                    original: original.clone(),
+                }
+            }
+        }
+    }
+}
+
+impl core::fmt::Debug for PromiseReactionKind {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            PromiseReactionKind::Then => write!(f, "Then"),
+            PromiseReactionKind::Forward => write!(f, "Forward"),
+            PromiseReactionKind::Async { .. } => write!(f, "Async(..)"),
+            PromiseReactionKind::AllElement { index, .. } => {
+                write!(f, "AllElement({index})")
+            }
+            PromiseReactionKind::Any { index, .. } => {
+                write!(f, "Any({index})")
+            }
+            PromiseReactionKind::AllSettled { index, .. } => {
+                write!(f, "AllSettled({index})")
+            }
+            PromiseReactionKind::Custom { .. } => {
+                write!(f, "Custom(..)")
+            }
+            PromiseReactionKind::FinallyCall { .. } => write!(f, "FinallyCall(..)"),
+            PromiseReactionKind::FinallyPropagate { .. } => {
+                write!(f, "FinallyPropagate(..)")
+            }
+        }
+    }
+}
+
+/// Shared countdown state for `Promise.all`.
+#[derive(Debug, Clone)]
+pub struct AllState {
+    pub remaining: usize,
+    pub results: Vec<Option<Value>>,
+    /// Set once the aggregate settles (first rejection wins; fulfillment when
+    /// `remaining` hits zero) so late settlements are ignored.
+    pub settled: bool,
+}
+
+/// Shared countdown state for `Promise.allSettled`.
+#[derive(Debug, Clone)]
+pub struct AllSettledState {
+    pub remaining: usize,
+    pub results: Vec<Option<Value>>,
+}
+
+/// A reaction registered on a pending promise: the dependent ("capability")
+/// promise to settle with the handler's outcome.
+#[derive(Clone)]
+pub struct PromiseReaction {
+    pub kind: PromiseReactionKind,
+    pub on_fulfilled: Option<Value>,
+    pub on_rejected: Option<Value>,
+    pub promise: Rc<RefCell<PromiseData>>,
+}
+
+impl core::fmt::Debug for PromiseReaction {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PromiseReaction")
+            .field("kind", &self.kind)
+            .field("on_fulfilled", &self.on_fulfilled)
+            .field("on_rejected", &self.on_rejected)
+            .finish()
+    }
+}
+
+/// Backing storage for a `Promise`.
+#[derive(Debug, Clone)]
+pub struct PromiseData {
+    pub state: PromiseState,
+    /// Own (non-index) properties, e.g. user-added `p.foo = 1`.
+    pub props: BTreeMap<Rc<str>, Property>,
+    /// `[[Prototype]]` override set via `Object.setPrototypeOf` (`None` means
+    /// the engine's `%Promise.prototype%`).
+    pub proto: Option<Rc<RefCell<Object>>>,
+}
+
+impl PromiseData {
+    pub fn new_pending() -> Self {
+        PromiseData {
+            state: PromiseState::Pending { reactions: Vec::new() },
+            props: BTreeMap::new(),
+            proto: None,
+        }
+    }
+
+    pub fn is_pending(&self) -> bool {
+        matches!(self.state, PromiseState::Pending { .. })
+    }
 }
 
 /// Backing storage for a `Map`.
@@ -166,6 +372,12 @@ pub struct SymbolData {
 }
 
 impl SymbolData {
+    /// The synthetic property-key string for a well-known symbol (mirrors
+    /// [`SymbolData::well_known`]'s id format).
+    pub fn well_known_key(name: &str) -> Rc<str> {
+        Rc::from(alloc::format!("__wk_{}__", name).as_str())
+    }
+
     /// Create a fresh, uniquely-identifiable symbol (not well-known).
     pub fn new(description: Option<Rc<str>>) -> Self {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -181,7 +393,7 @@ impl SymbolData {
     /// Create a well-known symbol with a fixed identity string.
     pub fn well_known(name: &str) -> Self {
         SymbolData {
-            id: Rc::from(alloc::format!("__wk_{}__", name).as_str()),
+            id: SymbolData::well_known_key(name),
             description: Some(Rc::from(name)),
             well_known: true,
         }
@@ -320,7 +532,9 @@ pub enum CtorRef {
 }
 
 /// A JavaScript object: an ordered map of named properties plus a prototype link.
-#[derive(Debug, Clone)]
+///
+/// `Debug` shares `Value`'s cycle guard (see above).
+#[derive(Clone)]
 pub struct Object {
     pub props: BTreeMap<Rc<str>, Property>,
     pub proto: Option<Rc<RefCell<Object>>>,
@@ -352,6 +566,71 @@ impl Object {
     }
 }
 
+// Cycle-safe `Debug` support: heap graphs contain reference cycles, so
+// formatting bails out with `…` past a small nesting depth.
+thread_local! {
+    static DEBUG_DEPTH: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+const DEBUG_MAX_DEPTH: usize = 8;
+
+fn debug_enter() -> bool {
+    let d = DEBUG_DEPTH.get();
+    if d >= DEBUG_MAX_DEPTH {
+        return false;
+    }
+    DEBUG_DEPTH.set(d + 1);
+    true
+}
+
+fn debug_exit() {
+    DEBUG_DEPTH.set(DEBUG_DEPTH.get().saturating_sub(1));
+}
+
+impl core::fmt::Debug for Value {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if !debug_enter() {
+            return write!(f, "…");
+        }
+        let r = match self {
+            Value::Undefined => write!(f, "Undefined"),
+            Value::Null => write!(f, "Null"),
+            Value::Boolean(b) => f.debug_tuple("Boolean").field(b).finish(),
+            Value::Number(n) => f.debug_tuple("Number").field(n).finish(),
+            Value::String(s) => f.debug_tuple("String").field(s).finish(),
+            Value::Object(o) => f.debug_tuple("Object").field(o).finish(),
+            Value::Array(a) => f.debug_tuple("Array").field(a).finish(),
+            Value::Function(func) => f.debug_tuple("Function").field(func).finish(),
+            Value::NativeFunction(nf) => f.debug_tuple("NativeFunction").field(nf).finish(),
+            Value::BigInt(s) => f.debug_tuple("BigInt").field(s).finish(),
+            Value::Regex(r) => f.debug_tuple("Regex").field(r).finish(),
+            Value::Symbol(s) => f.debug_tuple("Symbol").field(s).finish(),
+            Value::Map(m) => f.debug_tuple("Map").field(m).finish(),
+            Value::Set(s) => f.debug_tuple("Set").field(s).finish(),
+            Value::WeakMap(w) => f.debug_tuple("WeakMap").field(w).finish(),
+            Value::WeakSet(w) => f.debug_tuple("WeakSet").field(w).finish(),
+            Value::Promise(p) => f.debug_tuple("Promise").field(p).finish(),
+        };
+        debug_exit();
+        r
+    }
+}
+
+impl core::fmt::Debug for Object {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if !debug_enter() {
+            return write!(f, "…");
+        }
+        let r = f
+            .debug_struct("Object")
+            .field("props", &self.props)
+            .field("proto", &self.proto)
+            .field("ctor", &self.ctor)
+            .finish();
+        debug_exit();
+        r
+    }
+}
+
 /// The backing data for a host/native function. Unlike `Function`, this can
 /// carry its own property storage and prototype (e.g. `Object.prototype`).
 #[derive(Debug, Clone)]
@@ -365,6 +644,10 @@ pub struct NativeFunctionData {
     pub realm: Option<Rc<RealmInfo>>,
     /// The intrinsic default prototype this constructor produces.
     pub intrinsic_proto: Option<RealmProto>,
+    /// The `[[Prototype]]` when it is a *function value* (e.g. a NativeError
+    /// constructor's prototype is the `Error` constructor itself). Consulted
+    /// by `Object.getPrototypeOf`; `proto` handles Object-valued chains.
+    pub fn_value_proto: Option<Value>,
 }
 
 impl NativeFunctionData {
@@ -376,6 +659,7 @@ impl NativeFunctionData {
             constructable: false,
             realm: None,
             intrinsic_proto: None,
+            fn_value_proto: None,
         }
     }
 }
@@ -410,6 +694,16 @@ pub struct Function {
     pub super_ctor: Option<Value>,
     /// For arrow functions: the lexically-captured `this` binding.
     pub this_capture: Option<Value>,
+    /// Whether this is a generator function (`function*`): calls return a
+    /// generator object instead of executing the body.
+    pub generator: bool,
+    /// Whether this is an `async` function: calls return a `Promise` and the
+    /// body runs with `await` suspension enabled.
+    pub is_async: bool,
+    /// Whether this is a derived class constructor (`class C extends B`):
+    /// construction runs `super()` (binding `this` from it) and the
+    /// constructed `this` value—not the placeholder instance—is returned.
+    pub is_derived: bool,
     /// The realm this function was created in (`None` = the engine's home realm).
     pub realm: Option<Rc<RealmInfo>>,
 }

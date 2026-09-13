@@ -29,6 +29,14 @@ pub enum Stmt {
         params: Vec<Pattern>,
         body: Vec<Stmt>,
     },
+    /// Marker wrapper produced by the parser for `function*` bodies. The
+    /// function factory unwraps it (setting the generator flag) before the
+    /// body ever reaches the evaluator.
+    GeneratorBody(Vec<Stmt>),
+    /// Marker wrapper produced by the parser for `async function` / `async`
+    /// arrow bodies. The function factory unwraps it (setting the async flag)
+    /// before the body ever reaches the evaluator.
+    AsyncBody(Vec<Stmt>),
     Return(Option<Expr>),
     Block(Vec<Stmt>),
     If {
@@ -123,7 +131,11 @@ pub enum Expr {
         /// `?.()` short-circuiting applies to this call.
         optional: bool,
     },
+    /// Function expression. `name` is the optional binding created by a named
+    /// function expression (`var f = function g() { … }` — `g` is visible
+    /// inside the body only).
     Function {
+        name: Option<Rc<str>>,
         params: Vec<Pattern>,
         body: Vec<Stmt>,
     },
@@ -132,6 +144,9 @@ pub enum Expr {
         params: Vec<Pattern>,
         body: Vec<Stmt>,
     },
+    /// Comma operator `a, b, c`: every element is evaluated, the last one's
+    /// value is the result.
+    Sequence(Vec<Expr>),
     New {
         callee: Box<Expr>,
         args: Vec<Arg>,
@@ -179,6 +194,9 @@ pub enum Expr {
     },
     /// `await expr` (parsed so async code does not fail to parse).
     Await(Box<Expr>),
+    /// Internal marker: `ToString(ToPrimitive(e, string))` — used for template
+    /// literal substitutions, whose conversion differs from the `+` operator.
+    ToString(Box<Expr>),
     /// `yield expr` / `yield*` (parsed so generators do not fail to parse).
     Yield {
         expr: Option<Box<Expr>>,
@@ -203,6 +221,8 @@ fn stmt_has_private(s: &Stmt) -> bool {
             .any(|(p, e)| pattern_has_private(p) || e.as_ref().is_some_and(expr_has_private)),
         Stmt::Expr(e) => expr_has_private(e),
         Stmt::FunctionDecl { body, .. } => body.iter().any(stmt_has_private),
+        Stmt::GeneratorBody(body) => body.iter().any(stmt_has_private),
+        Stmt::AsyncBody(body) => body.iter().any(stmt_has_private),
         Stmt::Return(e) => e.as_ref().is_some_and(expr_has_private),
         Stmt::Block(b) => b.iter().any(stmt_has_private),
         Stmt::If { cond, then, else_ } => {
@@ -251,9 +271,10 @@ fn expr_has_private(e: &Expr) -> bool {
         Expr::Call { callee, args, .. } => {
             expr_has_private(callee) || args.iter().any(arg_has_private)
         }
-        Expr::Function { params, body } => {
+        Expr::Function { params, body, .. } => {
             params.iter().any(pattern_has_private) || body.iter().any(stmt_has_private)
         }
+        Expr::Sequence(exprs) => exprs.iter().any(expr_has_private),
         Expr::Arrow { params, body } => {
             params.iter().any(pattern_has_private) || body.iter().any(stmt_has_private)
         }
@@ -279,7 +300,7 @@ fn expr_has_private(e: &Expr) -> bool {
         Expr::Object(props) => props.iter().any(prop_has_private),
         Expr::Class(c) => class_has_private(c),
         Expr::Tagged { tag, subs, .. } => expr_has_private(tag) || subs.iter().any(expr_has_private),
-        Expr::Await(x) => expr_has_private(x),
+        Expr::Await(x) | Expr::ToString(x) => expr_has_private(x),
         Expr::Yield { expr, .. } => expr.as_ref().is_some_and(|x| expr_has_private(x)),
         Expr::Lit(_) | Expr::Ident(_) | Expr::This | Expr::Super => false,
     }

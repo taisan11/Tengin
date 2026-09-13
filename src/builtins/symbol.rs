@@ -59,33 +59,35 @@ pub(crate) fn symbol_key_for(
     }
 }
 
-pub(crate) fn symbol_to_string(
-    _e: &Engine,
-    this: &Value,
-    _a: &[Value],
-    _c: bool,
-) -> Result<Value, Error> {
+/// `thisSymbolValue`: a Symbol primitive or a Symbol wrapper's `__value__`.
+fn this_symbol_value(this: &Value) -> Option<Value> {
     match this {
-        Value::Symbol(s) => Ok(Value::String(Rc::from(
-            alloc::format!("Symbol({})", s.description.as_deref().unwrap_or("")).as_str(),
-        ))),
-        _ => Err(Error::Runtime(Value::String(Rc::from(
-            "TypeError: Symbol.prototype.toString called on non-symbol",
-        )))),
+        Value::Symbol(_) => Some(this.clone()),
+        Value::Object(o) => match o.borrow().props.get("__value__").map(|p| p.value.clone()) {
+            Some(s @ Value::Symbol(_)) => Some(s),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
-pub(crate) fn symbol_value_of(
-    _e: &Engine,
-    this: &Value,
-    _a: &[Value],
-    _c: bool,
-) -> Result<Value, Error> {
-    match this {
-        Value::Symbol(_) => Ok(this.clone()),
-        _ => Err(Error::Runtime(Value::String(Rc::from(
-            "TypeError: Symbol.prototype.valueOf called on non-symbol",
-        )))),
+pub(crate) fn symbol_to_string(e: &Engine, this: &Value, _a: &[Value], _c: bool) -> Result<Value, Error> {
+    match this_symbol_value(this) {
+        Some(Value::Symbol(s)) => Ok(Value::String(Rc::from(
+            alloc::format!("Symbol({})", s.description.as_deref().unwrap_or("")).as_str(),
+        ))),
+        _ => Err(Error::Runtime(e.make_type_error(
+            "Symbol.prototype.toString called on non-symbol",
+        ))),
+    }
+}
+
+pub(crate) fn symbol_value_of(e: &Engine, this: &Value, _a: &[Value], _c: bool) -> Result<Value, Error> {
+    match this_symbol_value(this) {
+        Some(s @ Value::Symbol(_)) => Ok(s),
+        _ => Err(Error::Runtime(e.make_type_error(
+            "Symbol.prototype.valueOf called on non-symbol",
+        ))),
     }
 }
 

@@ -267,7 +267,8 @@ pub(crate) fn str_trim_end(e: &Engine, this: &Value, _a: &[Value], _c: bool) -> 
 pub(crate) fn str_concat(e: &Engine, this: &Value, a: &[Value], _c: bool) -> Result<Value, Error> {
     let mut s = as_string(this, e);
     for v in a {
-        s.push_str(&v.to_string());
+        // ToString(ToPrimitive(arg, string)) — user toString/valueOf may run.
+        s.push_str(&e.to_string_fallible(v)?);
     }
     Ok(Value::String(Rc::from(s)))
 }
@@ -492,11 +493,18 @@ pub(crate) fn str_raw(e: &Engine, _this: &Value, a: &[Value], _c: bool) -> Resul
     Ok(Value::String(Rc::from(out)))
 }
 
-pub(crate) fn string_ctor(_e: &Engine, this: &Value, a: &[Value], construct: bool) -> Result<Value, Error> {
+pub(crate) fn string_ctor(e: &Engine, this: &Value, a: &[Value], construct: bool) -> Result<Value, Error> {
+    // `String(value)` with a Symbol returns SymbolDescriptiveString(value);
+    // otherwise: ToString(ToPrimitive(value, string)) — user code may run/throw.
     let s = if a.is_empty() {
         alloc::string::String::new()
+    } else if let Value::Symbol(sym) = &a[0] {
+        alloc::format!(
+            "Symbol({})",
+            sym.description.as_deref().unwrap_or("")
+        )
     } else {
-        a[0].to_string().to_string()
+        e.to_string_fallible(&a[0])?.to_string()
     };
     if construct {
         super::helpers::set_primitive(this, Value::String(Rc::from(s)));

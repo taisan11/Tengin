@@ -36,7 +36,7 @@ pub fn parse(src: &str) -> Result<Program, Error> {
             .join("\n");
         return Err(Error::Parse(msg));
     }
-    let mut c = Converter;
+    let mut c = Converter { strict: false };
     c.convert_program(&ret.program)
 }
 
@@ -53,7 +53,12 @@ fn quasi_str(q: &ast::TemplateElement) -> String {
         .to_string()
 }
 
-struct Converter;
+struct Converter {
+    /// Whether the program (script) is strict mode code, detected from the
+    /// directive prologue before conversion so statement-level early errors
+    /// (Annex B restrictions) can be applied.
+    strict: bool,
+}
 
 impl Converter {
     fn convert_program(&mut self, p: &ast::Program) -> Result<Program, Error> {
@@ -62,9 +67,22 @@ impl Converter {
         let strict = p.directives.iter().any(|d| {
             d.expression.value.as_str() == "use strict"
         });
+        self.strict = strict;
         Ok(Program {
             stmts: self.convert_stmts(&p.body)?,
             strict,
         })
+    }
+
+    /// `IsLabelledFunction(stmt)`: whether `stmt` is a labelled statement
+    /// (possibly nested labels) whose innermost item is a function declaration.
+    fn is_labelled_function(s: &ast::Statement) -> bool {
+        match s {
+            ast::Statement::LabeledStatement(l) => match &l.body {
+                ast::Statement::FunctionDeclaration(_) => true,
+                inner => Self::is_labelled_function(inner),
+            },
+            _ => false,
+        }
     }
 }

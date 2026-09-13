@@ -194,6 +194,49 @@ pub(crate) fn arr_reverse(_e: &Engine, this: &Value, _a: &[Value], _c: bool) -> 
     Ok(this.clone())
 }
 
+pub(crate) fn arr_sort(e: &Engine, this: &Value, a: &[Value], _c: bool) -> Result<Value, Error> {
+    let arr = as_array(this).ok_or_else(|| Error::Runtime(Value::String(Rc::from("not an array"))))?;
+    let cmp = a.first().cloned().unwrap_or(Value::Undefined);
+    let mut elems = arr.borrow().elems.clone();
+
+    // `undefined` always sorts to the end of the array (spec behaviour).
+    let mut defined: Vec<Value> = Vec::new();
+    let mut undef_count = 0usize;
+    for v in elems.drain(..) {
+        if matches!(v, Value::Undefined) {
+            undef_count += 1;
+        } else {
+            defined.push(v);
+        }
+    }
+
+    if cmp == Value::Undefined {
+        // Default comparator: lexicographic on ToString.
+        defined.sort_by(|x, y| x.to_string().as_ref().cmp(y.to_string().as_ref()));
+    } else {
+        // Stable insertion sort; the comparator result is converted with
+        // ToNumber: negative puts `x` before `y`, NaN/zero keeps the order.
+        for i in 1..defined.len() {
+            let mut j = i;
+            while j > 0 {
+                let r = e.call_value(&cmp, &Value::Undefined, &[defined[j - 1].clone(), defined[j].clone()])?;
+                let d = r.to_number();
+                if d.is_nan() || d <= 0.0 {
+                    break;
+                }
+                defined.swap(j - 1, j);
+                j -= 1;
+            }
+        }
+    }
+
+    for _ in 0..undef_count {
+        defined.push(Value::Undefined);
+    }
+    arr.borrow_mut().elems = defined;
+    Ok(this.clone())
+}
+
 pub(crate) fn arr_fill(_e: &Engine, this: &Value, a: &[Value], _c: bool) -> Result<Value, Error> {
     let arr = as_array(this).ok_or_else(|| Error::Runtime(Value::String(Rc::from("not an array"))))?;
     let val = a.first().cloned().unwrap_or(Value::Undefined);
@@ -290,7 +333,8 @@ pub(crate) fn arr_at(_e: &Engine, this: &Value, a: &[Value], _c: bool) -> Result
 
 // --- Array constructor & statics ---
 
-pub(crate) fn array_ctor(e: &Engine, _this: &Value, a: &[Value], _construct: bool) -> Result<Value, Error> {
+pub(crate) fn array_ctor(e: &Engine, _this: &Value, a: &[Value], construct: bool) -> Result<Value, Error> {
+    let proto = e.instance_proto(e.array_prototype.clone(), construct)?;
     if a.len() == 1 && matches!(a[0], Value::Number(_)) {
         let n = a[0].to_number() as usize;
         if fract(a[0].to_number()) != 0.0 || n > 1_000_000_000 {
@@ -298,13 +342,13 @@ pub(crate) fn array_ctor(e: &Engine, _this: &Value, a: &[Value], _construct: boo
         }
         return Ok(Value::Array(Rc::new(RefCell::new(ArrayData::new(
             alloc::vec![Value::Undefined; n],
-            Some(e.array_prototype.clone()),
+            Some(proto),
         )))));
     }
     let elems = a.to_vec();
     Ok(Value::Array(Rc::new(RefCell::new(ArrayData::new(
         elems,
-        Some(e.array_prototype.clone()),
+        Some(proto),
     )))))
 }
 

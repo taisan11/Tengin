@@ -46,24 +46,25 @@ pub(crate) fn key_matches(key: &PropKey, k: &str) -> bool {
     }
 }
 
-/// ECMAScript `ToInt32` (used by bitwise operators).
+/// ECMAScript `ToInt32` (used by bitwise operators). The modulo is computed
+/// with an exact fmod so huge values do not saturate through integer casts.
 pub(crate) fn to_int32(n: f64) -> i32 {
-    let n = n;
     if n.is_nan() || n.is_infinite() || n == 0.0 {
         return 0;
     }
-    let int = n.trunc();
-    (int as i64 % (1i64 << 32)) as i32
+    let m = n.trunc() % 4294967296.0;
+    let u = if m < 0.0 { m + 4294967296.0 } else { m };
+    (u as u32) as i32
 }
 
 /// ECMAScript `ToUint32` (used by unsigned right shift).
 pub(crate) fn to_uint32(n: f64) -> u32 {
-    let n = n;
     if n.is_nan() || n.is_infinite() || n == 0.0 {
         return 0;
     }
-    let int = n.trunc();
-    (int as i64 as u64 % (1u64 << 32)) as u32
+    let m = n.trunc() % 4294967296.0;
+    let u = if m < 0.0 { m + 4294967296.0 } else { m };
+    u as u32
 }
 
 /// ECMAScript `Abstract Equality Comparison` (`==` / `!=`).

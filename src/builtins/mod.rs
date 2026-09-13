@@ -5,9 +5,12 @@ use crate::interpreter::Engine;
 use crate::value::{NativeFn, Object, Property, Value};
 
 mod array;
+mod bigint;
+pub(crate) mod bigint_num;
 mod boolean;
 mod collections;
 mod error;
+mod generator;
 mod global;
 mod helpers;
 mod json;
@@ -15,14 +18,17 @@ mod math;
 mod misc;
 mod number;
 mod object;
+mod promise;
 mod regexp;
 mod string;
 mod symbol;
+mod timers;
 
 use array::{
     arr_at, arr_concat, arr_every, arr_fill, arr_filter, arr_find, arr_find_index, arr_for_each,
     arr_from, arr_includes, arr_index_of, arr_is_array, arr_join, arr_last_index_of, arr_map,
-    arr_of, arr_pop, arr_push, arr_reduce, arr_reverse, arr_shift, arr_slice, arr_some, arr_splice,
+    arr_of, arr_pop, arr_push, arr_reduce, arr_reverse, arr_shift, arr_slice, arr_some, arr_sort,
+    arr_splice,
     arr_unshift, array_ctor,
 };
 use boolean::{bool_to_string, bool_value_of, boolean_ctor};
@@ -33,13 +39,16 @@ use global::{
     is_finite_fn, is_nan_fn, make_assert,
 };
 use helpers::{
-    engine_global, named_native, native, proto_data, proto_method, proto_method_len,
-    prototype_of, reg_ctor, reg_error, reg_error_sub, set_static, set_static_value,
-};
-use json::{json_parse, json_stringify};
+    engine_global, named_native, named_native_len, native, proto_data, proto_method,
+    proto_method_len, prototype_of, reg_ctor, reg_error, reg_error_sub, set_static,
+    set_static_value,
+};use json::{json_parse, json_stringify};
 use math::{
-    math_abs, math_ceil, math_cos, math_exp, math_floor, math_log, math_max, math_min, math_pow,
-    math_random, math_round, math_sign, math_sin, math_sqrt, math_tan, math_trunc,
+    math_abs, math_acos, math_acosh, math_asin, math_asinh, math_atan, math_atan2, math_atanh,
+    math_cbrt, math_ceil, math_clz32, math_cos, math_cosh, math_exp, math_expm1, math_f16round,
+    math_floor, math_fround, math_hypot, math_imul, math_log, math_log10, math_log1p, math_log2,
+    math_max, math_min, math_pow, math_random, math_round, math_sign, math_sin, math_sinh,
+    math_sqrt, math_sumprecise, math_tan, math_tanh, math_trunc,
 };
 use misc::{register_misc, register_reflect};
 use number::{
@@ -48,7 +57,7 @@ use number::{
     num_to_string, num_value_of,
 };
 use object::{
-    apply_fn, bind_fn, call_fn, func_to_string, function_ctor, obj_assign, obj_create,
+    apply_fn, bind_fn, call_fn, func_to_string, function_ctor, async_function_ctor, obj_assign, obj_create,
     obj_define_properties, obj_define_property, obj_entries, obj_get_own_descriptor,
     obj_get_own_descriptors, obj_get_own_names, obj_get_own_symbols, obj_get_proto_of,
     obj_has_own, obj_identity, obj_is, obj_is_proto_of, obj_keys, obj_prop_enum, obj_set_proto_of,
@@ -118,6 +127,7 @@ pub fn register_builtins(engine: &mut Engine) {
     proto_method(&array_proto, "join", arr_join);
     proto_method(&array_proto, "toString", arr_join);
     proto_method(&array_proto, "reverse", arr_reverse);
+    proto_method(&array_proto, "sort", arr_sort);
     proto_method(&array_proto, "fill", arr_fill);
     proto_method(&array_proto, "find", arr_find);
     proto_method(&array_proto, "findIndex", arr_find_index);
@@ -192,14 +202,43 @@ pub fn register_builtins(engine: &mut Engine) {
 
     // --- Error.prototype ---
     proto_method(&error_proto, "toString", err_to_string);
-    proto_data(&error_proto, "name", Value::String(Rc::from("Error")));
-    proto_data(&error_proto, "message", Value::String(Rc::from("")));
+    error_proto.borrow_mut().props.insert(
+        Rc::from("name"),
+        Property {
+            value: Value::String(Rc::from("Error")),
+            writable: true,
+            enumerable: false,
+            configurable: true,
+            get: None,
+            set: None,
+        },
+    );
+    error_proto.borrow_mut().props.insert(
+        Rc::from("message"),
+        Property {
+            value: Value::String(Rc::from("")),
+            writable: true,
+            enumerable: false,
+            configurable: true,
+            get: None,
+            set: None,
+        },
+    );
 
     // --- Global constructors ---
     let obj_ctor = reg_ctor(engine, "Object", object_ctor, object_proto.clone());
     proto_data(&object_proto, "constructor", obj_ctor.clone());
     let fn_ctor = reg_ctor(engine, "Function", function_ctor, function_proto.clone());
     proto_data(&function_proto, "constructor", fn_ctor.clone());
+    // `AsyncFunction` with `%AsyncFunction.prototype%` (proto:
+    // `%Function.prototype%`, tagged for `Object.prototype.toString`).
+    let async_proto = engine.async_function_prototype.clone();
+    let async_ctor = reg_ctor(engine, "AsyncFunction", async_function_ctor, async_proto.clone());
+    proto_data(&async_proto, "constructor", async_ctor.clone());
+    async_proto.borrow_mut().props.insert(
+        Rc::from(crate::value::SymbolData::well_known_key("toStringTag").as_ref()),
+        Property::config(Value::String(Rc::from("AsyncFunction"))),
+    );
     let arr_ctor = reg_ctor(engine, "Array", array_ctor, array_proto.clone());
     proto_data(&array_proto, "constructor", arr_ctor.clone());
     let str_ctor = reg_ctor(engine, "String", string_ctor, string_proto.clone());
@@ -293,6 +332,13 @@ pub fn register_builtins(engine: &mut Engine) {
     let syntax_err = reg_error_sub(engine, "SyntaxError", error_ctor, error_proto.clone());
     let type_err = reg_error_sub(engine, "TypeError", error_ctor, error_proto.clone());
     let uri_err = reg_error_sub(engine, "URIError", error_ctor, error_proto.clone());
+    // NativeError constructors have the `Error` constructor as their
+    // `[[Prototype]]` (`Object.getPrototypeOf(EvalError) === Error`).
+    for sub in [&eval_err, &range_err, &ref_err, &syntax_err, &type_err, &uri_err] {
+        if let Value::NativeFunction(nf) = sub {
+            nf.borrow_mut().fn_value_proto = Some(err_ctor.clone());
+        }
+    }
     engine.type_error_proto = prototype_of(&type_err).unwrap_or(error_proto.clone());
     engine.range_error_proto = prototype_of(&range_err).unwrap_or(error_proto.clone());
     engine.reference_error_proto = prototype_of(&ref_err).unwrap_or(error_proto.clone());
@@ -302,27 +348,55 @@ pub fn register_builtins(engine: &mut Engine) {
 
     // Math.
     let mut math = Object::with_proto(object_proto.clone());
-    let math_entries: [(&str, NativeFn); 16] = [
-        ("abs", math_abs),
-        ("floor", math_floor),
-        ("ceil", math_ceil),
-        ("round", math_round),
-        ("trunc", math_trunc),
-        ("max", math_max),
-        ("min", math_min),
-        ("sqrt", math_sqrt),
-        ("pow", math_pow),
-        ("sign", math_sign),
-        ("exp", math_exp),
-        ("log", math_log),
-        ("sin", math_sin),
-        ("cos", math_cos),
-        ("tan", math_tan),
-        ("random", math_random),
+    // (name, fn, length): the `length` values are specified per method.
+    let math_entries: [(&str, NativeFn, usize); 37] = [
+        ("abs", math_abs, 1),
+        ("acos", math_acos, 1),
+        ("acosh", math_acosh, 1),
+        ("asin", math_asin, 1),
+        ("asinh", math_asinh, 1),
+        ("atan", math_atan, 1),
+        ("atan2", math_atan2, 2),
+        ("atanh", math_atanh, 1),
+        ("cbrt", math_cbrt, 1),
+        ("ceil", math_ceil, 1),
+        ("clz32", math_clz32, 1),
+        ("cos", math_cos, 1),
+        ("cosh", math_cosh, 1),
+        ("exp", math_exp, 1),
+        ("expm1", math_expm1, 1),
+        ("floor", math_floor, 1),
+        ("fround", math_fround, 1),
+        ("f16round", math_f16round, 1),
+        ("hypot", math_hypot, 2),
+        ("imul", math_imul, 2),
+        ("log", math_log, 1),
+        ("log10", math_log10, 1),
+        ("log1p", math_log1p, 1),
+        ("log2", math_log2, 1),
+        ("max", math_max, 2),
+        ("min", math_min, 2),
+        ("pow", math_pow, 2),
+        ("random", math_random, 0),
+        ("round", math_round, 1),
+        ("sign", math_sign, 1),
+        ("sin", math_sin, 1),
+        ("sinh", math_sinh, 1),
+        ("sqrt", math_sqrt, 1),
+        ("sumPrecise", math_sumprecise, 1),
+        ("tan", math_tan, 1),
+        ("tanh", math_tanh, 1),
+        ("trunc", math_trunc, 1),
     ];
-    for (n, f) in math_entries {
-        math.props.insert(Rc::from(n), Property::method(named_native(n, f)));
+    for (n, f, len) in math_entries {
+        math.props.insert(Rc::from(n), Property::method(named_native_len(n, f, len)));
     }
+    // `Math[Symbol.toStringTag]` = "Math" ({ Writable: false, Enumerable:
+    // false, Configurable: true }).
+    math.props.insert(
+        Rc::from(crate::value::SymbolData::well_known_key("toStringTag").as_ref()),
+        Property::config(Value::String(Rc::from("Math"))),
+    );
     for (n, v) in [
         ("E", Value::Number(core::f64::consts::E)),
         ("PI", Value::Number(core::f64::consts::PI)),
@@ -363,5 +437,8 @@ pub fn register_builtins(engine: &mut Engine) {
     register_symbol(engine);
     register_collections(engine);
     register_misc(engine);
+    generator::register_generator(engine);
+    promise::register_promise(engine);
+    timers::register_timers(engine);
 }
 

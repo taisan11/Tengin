@@ -17,6 +17,15 @@ pub(super) fn native(f: NativeFn) -> Value {
     crate::value::native(f)
 }
 
+/// Resolve a property-key *argument* to its storage key: `Symbol` values map
+/// to their unique id string; everything else goes through `ToString`.
+pub(super) fn key_arg(v: &Value) -> Rc<str> {
+    match v {
+        Value::Symbol(s) => s.id.clone(),
+        other => other.to_string(),
+    }
+}
+
 /// The `length` (formal parameter count) of a well-known built-in function.
 ///
 /// The `NativeFn` signature does not carry arity, so it is supplied here.
@@ -114,6 +123,7 @@ fn ctor_intrinsic(name: &str) -> RealmProto {
         "Number" => RealmProto::Number,
         "String" => RealmProto::String,
         "Boolean" => RealmProto::Boolean,
+        "Promise" => RealmProto::Promise,
         _ => RealmProto::Object,
     }
 }
@@ -206,7 +216,7 @@ pub(super) fn reg_error(engine: &mut Engine, name: &str, f: NativeFn, proto: Rc<
         nf.borrow_mut().constructable = true;
         nf.borrow_mut().proto = Some(engine.function_prototype.clone());
         nf.borrow_mut().realm = Some(engine.realm.clone());
-        nf.borrow_mut().intrinsic_proto = Some(RealmProto::Object);
+        nf.borrow_mut().intrinsic_proto = Some(error_intrinsic(name));
         nf.borrow_mut()
             .props
             .insert(Rc::from("prototype"), Property::constant(Value::Object(proto.clone())));
@@ -222,16 +232,68 @@ pub(super) fn reg_error(engine: &mut Engine, name: &str, f: NativeFn, proto: Rc<
 }
 
 /// Register a subclass of `Error` with its own prototype linked to `parent`.
+/// The NativeError prototype gets its own `name` ("EvalError"…) and `message`
+/// ("") properties, both `{ Writable: true, Enumerable: false, Configurable:
+/// true }`, per the spec's Standard Built-in Objects table.
 pub(super) fn reg_error_sub(
     engine: &mut Engine,
     name: &str,
     f: NativeFn,
     parent: Rc<RefCell<Object>>,
 ) -> Value {
-    let proto = Rc::new(RefCell::new(Object::with_proto(parent)));
+    // The realm pre-creates every error prototype; reuse it so that the
+    // registered constructor, the engine's intrinsic slots and the realm's
+    // `GetFunctionRealm` fallback all share one prototype object.
+    let proto = engine
+        .realm
+        .error_prototype_for(name)
+        .unwrap_or_else(|| Rc::new(RefCell::new(Object::with_proto(parent))));
+    {
+        let mut b = proto.borrow_mut();
+        b.props.insert(
+            Rc::from("name"),
+            Property {
+                value: Value::String(Rc::from(name)),
+                writable: true,
+                enumerable: false,
+                configurable: true,
+                get: None,
+                set: None,
+            },
+        );
+        b.props.insert(
+            Rc::from("message"),
+            Property {
+                value: Value::String(Rc::from("")),
+                writable: true,
+                enumerable: false,
+                configurable: true,
+                get: None,
+                set: None,
+            },
+        );
+    }
     let ctor = reg_error(engine, name, f, proto.clone());
     proto_data(&proto, "constructor", ctor.clone());
     ctor
+}
+
+/// The `RealmProto` intrinsic kind for an error constructor name.
+pub(super) fn error_intrinsic(name: &str) -> RealmProto {
+    match name {
+        "Error" => RealmProto::Error,
+        other => RealmProto::NativeError(
+            match other {
+                "EvalError" => "EvalError",
+                "RangeError" => "RangeError",
+                "ReferenceError" => "ReferenceError",
+                "SyntaxError" => "SyntaxError",
+                "TypeError" => "TypeError",
+                "URIError" => "URIError",
+                _ => "Error",
+            },
+        ),
+    }
 }
 
 /// Wrap a primitive value into its corresponding wrapper object.
@@ -240,6 +302,8 @@ pub(super) fn wrap(engine: &Engine, primitive: Value) -> Value {
         Value::String(_) => engine.string_prototype.clone(),
         Value::Number(_) => engine.number_prototype.clone(),
         Value::Boolean(_) => engine.boolean_prototype.clone(),
+        Value::BigInt(_) => engine.bigint_prototype.clone(),
+        Value::Symbol(_) => engine.symbol_prototype.clone(),
         _ => return primitive,
     };
     let o = Rc::new(RefCell::new(Object::with_proto(proto)));
@@ -270,6 +334,7 @@ pub(super) fn proto_of(v: &Value) -> Option<Rc<RefCell<Object>>> {
         Value::Array(a) => a.borrow().proto.clone(),
         Value::Function(f) => f.borrow().proto.clone(),
         Value::NativeFunction(nf) => nf.borrow().proto.clone(),
+        Value::Promise(p) => p.borrow().proto.clone(),
         _ => None,
     }
 }
@@ -302,6 +367,7 @@ pub(super) fn set_proto_of_val(v: &Value, p: Option<Rc<RefCell<Object>>>) {
         Value::Array(a) => a.borrow_mut().proto = p,
         Value::Function(f) => f.borrow_mut().proto = p,
         Value::NativeFunction(nf) => nf.borrow_mut().proto = p,
+        Value::Promise(pr) => pr.borrow_mut().proto = p,
         _ => {}
     }
 }
