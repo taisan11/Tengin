@@ -127,7 +127,6 @@ jobs:
         run: mkdir -p test262-logs/shards
 
       - name: Download shard logs
-        id: download
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
@@ -135,8 +134,7 @@ jobs:
           path: test262-logs/shards
           merge-multiple: true
 
-      - name: Build aggregate log
-        id: aggregate
+      - name: Validate shard logs
         shell: bash
         run: |
           set -euo pipefail
@@ -146,17 +144,51 @@ jobs:
           )
 
           found="${#logs[@]}"
-          pass=0
-          fail=0
-          skip=0
-          files_run=0
-
-          if (( found > 0 )); then
-            pass="$(awk '/^  PASS[[:space:]]*:/ {sum += $NF} END {print sum + 0}' "${logs[@]}")"
-            fail="$(awk '/^  FAIL[[:space:]]*:/ {sum += $NF} END {print sum + 0}' "${logs[@]}")"
-            skip="$(awk '/^  SKIP[[:space:]]*:/ {sum += $NF} END {print sum + 0}' "${logs[@]}")"
-            files_run="$(awk '/^files run[[:space:]]*:/ {sum += $NF} END {print sum + 0}' "${logs[@]}")"
+          if (( found != TEST262_SHARD_COUNT )); then
+            echo "Expected ${TEST262_SHARD_COUNT} shard logs, found ${found}."
+            exit 1
           fi
+
+          for log in "${logs[@]}"; do
+            if ! grep -qx 'build_exit_code: 0' "${log}"; then
+              echo "Incomplete shard log: $(basename "${log}") does not contain a successful build."
+              exit 1
+            fi
+
+            if [[ "$(grep -c '^=== test262 run complete ===$' "${log}" || true)" -ne 1 ]]; then
+              echo "Incomplete shard log: $(basename "${log}") does not contain exactly one completed test262 summary."
+              exit 1
+            fi
+
+            for pattern in \
+              '^files run[[:space:]]*:[[:space:]]*[0-9]+$' \
+              '^  PASS[[:space:]]*:[[:space:]]*[0-9]+$' \
+              '^  FAIL[[:space:]]*:[[:space:]]*[0-9]+$' \
+              '^  SKIP[[:space:]]*:[[:space:]]*[0-9]+$'
+            do
+              if [[ "$(grep -Ec "${pattern}" "${log}" || true)" -ne 1 ]]; then
+                echo "Incomplete shard log: $(basename "${log}") is missing or duplicates summary field matching ${pattern}."
+                exit 1
+              fi
+            done
+          done
+
+          echo "Validated ${found}/${TEST262_SHARD_COUNT} complete shard logs."
+
+      - name: Build aggregate log
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -t logs < <(
+            find test262-logs/shards -maxdepth 1 -type f -name 'shard-*.log' -print | sort -V
+          )
+
+          found="${#logs[@]}"
+          pass="$(awk '/^  PASS[[:space:]]*:/ {sum += $NF} END {print sum + 0}' "${logs[@]}")"
+          fail="$(awk '/^  FAIL[[:space:]]*:/ {sum += $NF} END {print sum + 0}' "${logs[@]}")"
+          skip="$(awk '/^  SKIP[[:space:]]*:/ {sum += $NF} END {print sum + 0}' "${logs[@]}")"
+          files_run="$(awk '/^files run[[:space:]]*:/ {sum += $NF} END {print sum + 0}' "${logs[@]}")"
 
           cases=$((pass + fail + skip))
           pass_rate="$(awk -v p="${pass}" -v t="${cases}" \
@@ -184,8 +216,6 @@ jobs:
             done
           } > test262-logs/latest.log
 
-          echo "shards_found=${found}" >> "${GITHUB_OUTPUT}"
-
       - name: Commit and push aggregate log
         shell: bash
         run: |
@@ -201,15 +231,3 @@ jobs:
 
           git commit -m "ci: update full test262 log [skip ci]"
           git push origin "HEAD:${GITHUB_REF_NAME}"
-
-      - name: Verify all shards uploaded
-        if: always()
-        shell: bash
-        env:
-          SHARDS_FOUND: ${{ steps.aggregate.outputs.shards_found }}
-        run: |
-          set -euo pipefail
-          if [[ "${SHARDS_FOUND:-0}" != "${TEST262_SHARD_COUNT}" ]]; then
-            echo "Expected ${TEST262_SHARD_COUNT} shard logs, found ${SHARDS_FOUND:-0}."
-            exit 1
-          fi
