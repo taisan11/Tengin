@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 use core::cell::RefCell;
 
 use crate::error::{Error, Result};
-use crate::value::{CtorRef, Object, Property, SymbolData, Value};
+use crate::value::{ArrayValueIter, CtorRef, Object, Property, SymbolData, Value};
 
 use super::ops::symbol_iterator_id;
 use super::Engine;
@@ -27,6 +27,13 @@ pub(crate) enum PrimitiveHint {
 }
 
 impl Engine {
+    /// Return a lazy iterator for an array's indexed values. This is used by
+    /// streaming consumers so a sparse array with a huge logical length does
+    /// not first materialize every hole in memory.
+    pub(crate) fn array_values_iter(&self, array: Rc<RefCell<crate::value::ArrayData>>) -> ArrayValueIter {
+        ArrayValueIter::new(array)
+    }
+
     /// Upgrade a weak constructor back-reference into a usable value.
     fn resolve_ctor(ctor: &Option<CtorRef>) -> Option<Value> {
         match ctor {
@@ -99,10 +106,10 @@ impl Engine {
             }
             Value::Array(a) => {
                 if key == "length" {
-                    return Value::Number(a.borrow().elems.len() as f64);
+                    return Value::Number(a.borrow().logical_len() as f64);
                 }
                 if let Ok(i) = key.parse::<usize>() {
-                    return a.borrow().elems.get(i).cloned().unwrap_or(Value::Undefined);
+                    return a.borrow().get_index(i).unwrap_or(Value::Undefined);
                 }
                 if let Some(p) = a.borrow().props.get(key) {
                     if p.is_accessor() {
@@ -118,14 +125,14 @@ impl Engine {
             Value::Function(f) => {
                 if let Some(p) = f.borrow().props.get(key).cloned() {
                     if p.is_accessor() {
-                        if let Some(g) = p.get {
+                        if let Some(g) = &p.get {
                             return self
                                 .call_function(&g, base, &[])
                                 .unwrap_or(Value::Undefined);
                         }
                         return Value::Undefined;
                     }
-                    return p.value;
+                    return p.value.clone();
                 }
                 let mut cur = f.borrow().proto.clone();
                 while let Some(c) = cur {
@@ -153,14 +160,14 @@ impl Engine {
                 if let Some(sup) = f.borrow().super_ctor.clone() {
                     match self.get_raw_property(&sup, key) {
                         Some(p) if p.is_accessor() => {
-                            if let Some(g) = p.get {
+                            if let Some(g) = &p.get {
                                 return self
                                     .call_function(&g, base, &[])
                                     .unwrap_or(Value::Undefined);
                             }
                             return Value::Undefined;
                         }
-                        Some(p) => return p.value,
+                        Some(p) => return p.value.clone(),
                         None => {}
                     }
                 }
@@ -245,14 +252,14 @@ impl Engine {
             Value::NativeFunction(nf) => {
                 if let Some(p) = nf.borrow().props.get(key).cloned() {
                     if p.is_accessor() {
-                        if let Some(g) = p.get {
+                        if let Some(g) = &p.get {
                             return self
                                 .call_function(&g, base, &[])
                                 .unwrap_or(Value::Undefined);
                         }
                         return Value::Undefined;
                     }
-                    return p.value;
+                    return p.value.clone();
                 }
                 // A native function (e.g. a builtin prototype method) may have no
                 // explicit prototype; fall back to `Function.prototype` so that
@@ -428,10 +435,13 @@ impl Engine {
         let mut seen: BTreeSet<Rc<str>> = BTreeSet::new();
         match base {
             Value::Array(a) => {
-                let len = a.borrow().elems.len();
+                let len = a.borrow().logical_len();
                 for i in 0..len {
-                    seen.insert(Rc::from(i.to_string()));
+                    if a.borrow().get_index(i).is_some() {
+                        seen.insert(Rc::from(i.to_string()));
+                    }
                 }
+                for i in a.borrow().sparse.keys() { seen.insert(Rc::from(i.to_string())); }
                 let b = a.borrow();
                 for (k, p) in b.props.iter() {
                     if p.enumerable {
@@ -476,7 +486,11 @@ impl Engine {
             }
         }
         match base {
-            Value::Array(a) => Ok(a.borrow().elems.clone()),
+            Value::Array(a) => {
+                let b = a.borrow();
+                if b.sparse.is_empty() { Ok(b.elems.clone()) }
+                else { Ok((0..b.logical_len()).map(|i| b.get_index(i).unwrap_or(Value::Undefined)).collect()) }
+            }
             Value::String(s) => {
                 let mut v = Vec::new();
                 for ch in s.chars() {
@@ -557,8 +571,11 @@ impl Engine {
                         Property::new(v.clone()),
                     );
                 }
+                for (i, v) in elems.sparse.iter() {
+                    obj.props.insert(Rc::from(i.to_string().as_str()), Property::new(v.clone()));
+                }
                 obj.props
-                    .insert(Rc::from("length"), Property::new(Value::Number(elems.elems.len() as f64)));
+                    .insert(Rc::from("length"), Property::new(Value::Number(elems.logical_len() as f64)));
                 Ok(Rc::new(RefCell::new(obj)))
             }
             _ => Err(Error::Runtime(Value::String(Rc::from(
@@ -578,7 +595,7 @@ impl Engine {
                     // assignment is a no-op in sloppy mode and a TypeError in
                     // strict mode.
                     Some(prop) if prop.is_accessor() => {
-                        if let Some(s) = prop.set {
+                        if let Some(s) = &prop.set {
                             self.call_function(&s, base, &[val])?;
                         } else if self.strict.get() {
                             return Err(Error::Runtime(self.make_type_error(
@@ -600,33 +617,26 @@ impl Engine {
                     // writable/enumerable property).
                     Some(prop) => {
                         o.borrow_mut().props.insert(
-                            Rc::from(key),
-                            Property {
-                                value: val,
-                                ..prop
-                            },
+                            self.intern_key(key),
+                            prop.with_value(val),
                         );
                     }
                     None => {
-                        o.borrow_mut().props.insert(Rc::from(key), Property::new(val));
+                        o.borrow_mut().props.insert(self.intern_key(key), Property::new(val));
                     }
                 }
             }
             Value::Array(a) => {
                 if key == "length" {
                     let n = val.to_number() as usize;
-                    a.borrow_mut().elems.resize(n, Value::Undefined);
+                    a.borrow_mut().set_length(n);
                 } else if let Ok(i) = key.parse::<usize>() {
-                    let mut arr = a.borrow_mut();
-                    while arr.elems.len() <= i {
-                        arr.elems.push(Value::Undefined);
-                    }
-                    arr.elems[i] = val;
+                    a.borrow_mut().set_index(i, val);
                 } else {
                     let existing = a.borrow().props.get(key).cloned();
                     match existing {
                         Some(prop) if prop.is_accessor() => {
-                            if let Some(s) = prop.set {
+                            if let Some(s) = &prop.set {
                                 self.call_function(&s, base, &[val])?;
                             } else if self.strict.get() {
                                 return Err(Error::Runtime(self.make_type_error(
@@ -644,10 +654,10 @@ impl Engine {
                         Some(prop) => {
                             a.borrow_mut()
                                 .props
-                                .insert(Rc::from(key), Property { value: val, ..prop });
+                                .insert(self.intern_key(key), prop.with_value(val));
                         }
                         None => {
-                            a.borrow_mut().props.insert(Rc::from(key), Property::new(val));
+                            a.borrow_mut().props.insert(self.intern_key(key), Property::new(val));
                         }
                     }
                 }
@@ -656,7 +666,7 @@ impl Engine {
                 let existing = f.borrow().props.get(key).cloned();
                 match existing {
                     Some(prop) if prop.is_accessor() => {
-                        if let Some(s) = prop.set {
+                        if let Some(s) = &prop.set {
                             self.call_function(&s, base, &[val])?;
                         } else if self.strict.get() {
                             return Err(Error::Runtime(self.make_type_error(
@@ -674,10 +684,10 @@ impl Engine {
                     Some(prop) => {
                         f.borrow_mut()
                             .props
-                            .insert(Rc::from(key), Property { value: val, ..prop });
+                            .insert(self.intern_key(key), prop.with_value(val));
                     }
                     None => {
-                        f.borrow_mut().props.insert(Rc::from(key), Property::new(val));
+                        f.borrow_mut().props.insert(self.intern_key(key), Property::new(val));
                     }
                 }
             }
@@ -685,7 +695,7 @@ impl Engine {
                 let existing = nf.borrow().props.get(key).cloned();
                 match existing {
                     Some(prop) if prop.is_accessor() => {
-                        if let Some(s) = prop.set {
+                        if let Some(s) = &prop.set {
                             self.call_function(&s, base, &[val])?;
                         } else if self.strict.get() {
                             return Err(Error::Runtime(self.make_type_error(
@@ -703,10 +713,10 @@ impl Engine {
                     Some(prop) => {
                         nf.borrow_mut()
                             .props
-                            .insert(Rc::from(key), Property { value: val, ..prop });
+                            .insert(self.intern_key(key), prop.with_value(val));
                     }
                     None => {
-                        nf.borrow_mut().props.insert(Rc::from(key), Property::new(val));
+                        nf.borrow_mut().props.insert(self.intern_key(key), Property::new(val));
                     }
                 }
             }
@@ -718,7 +728,7 @@ impl Engine {
                 }
             }
             Value::Promise(p) => {
-                p.borrow_mut().props.insert(Rc::from(key), Property::new(val));
+                p.borrow_mut().props.insert(self.intern_key(key), Property::new(val));
             }
             _ => {}
         }
@@ -731,7 +741,7 @@ impl Engine {
             Value::Object(o) => o.borrow().props.contains_key(key),
             Value::Array(a) => {
                 key == "length"
-                    || key.parse::<usize>().map(|i| i < a.borrow().elems.len()).unwrap_or(false)
+                    || key.parse::<usize>().map(|i| i < a.borrow().logical_len() && a.borrow().get_index(i).is_some()).unwrap_or(false)
                     || a.borrow().props.contains_key(key)
             }
             Value::Function(f) => f.borrow().props.contains_key(key),
@@ -748,7 +758,7 @@ impl Engine {
             Value::Object(o) => o.borrow().props.get(key).map(|p| p.enumerable),
             Value::Array(a) => {
                 if let Ok(i) = key.parse::<usize>() {
-                    Some(i < a.borrow().elems.len())
+                    Some(i < a.borrow().logical_len() && a.borrow().get_index(i).is_some())
                 } else {
                     a.borrow().props.get(key).map(|p| p.enumerable)
                 }
@@ -814,10 +824,10 @@ impl Engine {
                     return Err(self.type_error("Cannot redefine property"));
                 }
                 if prop.is_accessor() {
-                    if get.is_some() && !Value::same_value(&prop.get.unwrap_or(Value::Undefined), get.as_ref().unwrap_or(&Value::Undefined)) {
+                    if get.is_some() && !Value::same_value(prop.get.as_ref().unwrap_or(&Value::Undefined), get.as_ref().unwrap_or(&Value::Undefined)) {
                         return Err(self.type_error("Cannot redefine property"));
                     }
-                    if set.is_some() && !Value::same_value(&prop.set.unwrap_or(Value::Undefined), set.as_ref().unwrap_or(&Value::Undefined)) {
+                    if set.is_some() && !Value::same_value(prop.set.as_ref().unwrap_or(&Value::Undefined), set.as_ref().unwrap_or(&Value::Undefined)) {
                         return Err(self.type_error("Cannot redefine property"));
                     }
                 } else if !prop.writable && has_value && !Value::same_value(&prop.value, &value) {
@@ -841,30 +851,26 @@ impl Engine {
     fn define_raw(&self, base: &Value, key: &str, prop: Property) {
         match base {
             Value::Object(o) => {
-                o.borrow_mut().props.insert(Rc::from(key), prop);
+                o.borrow_mut().props.insert(self.intern_key(key), prop);
             }
             Value::Function(f) => {
-                f.borrow_mut().props.insert(Rc::from(key), prop);
+                f.borrow_mut().props.insert(self.intern_key(key), prop);
             }
             Value::NativeFunction(nf) => {
-                nf.borrow_mut().props.insert(Rc::from(key), prop);
+                nf.borrow_mut().props.insert(self.intern_key(key), prop);
             }
             Value::Array(a) => {
                 if key == "length" {
                     let n = prop.value.to_number() as usize;
-                    a.borrow_mut().elems.resize(n, Value::Undefined);
+                    a.borrow_mut().set_length(n);
                 } else if let Ok(i) = key.parse::<usize>() {
-                    let mut arr = a.borrow_mut();
-                    while arr.elems.len() <= i {
-                        arr.elems.push(Value::Undefined);
-                    }
-                    arr.elems[i] = prop.value;
+                    a.borrow_mut().set_index(i, prop.value.clone());
                 } else {
-                    a.borrow_mut().props.insert(Rc::from(key), prop);
+                    a.borrow_mut().props.insert(self.intern_key(key), prop);
                 }
             }
             Value::Promise(p) => {
-                p.borrow_mut().props.insert(Rc::from(key), prop);
+                p.borrow_mut().props.insert(self.intern_key(key), prop);
             }
             _ => {}
         }
@@ -895,12 +901,13 @@ impl Engine {
         }
         match base {
             Value::Array(a) => {
-                let elems = a.borrow().elems.clone();
+                let elems = a.borrow();
                 let p = if key == "length" {
-                    Property::data(Value::Number(elems.len() as f64), true, false, false)
+                    Property::data(Value::Number(elems.logical_len() as f64), true, false, false)
                 } else if let Ok(i) = key.parse::<usize>() {
-                    if i < elems.len() {
-                        Property::new(elems[i].clone())
+                    if i < elems.logical_len() {
+                        if let Some(v) = elems.get_index(i) { Property::new(v) }
+                        else { return Value::Undefined; }
                     } else {
                         return Value::Undefined;
                     }
@@ -937,6 +944,9 @@ impl Engine {
                     names.push(Rc::from(i.to_string().as_str()));
                 }
                 let b = a.borrow();
+                for i in b.sparse.keys() {
+                    names.push(Rc::from(i.to_string().as_str()));
+                }
                 for k in b.props.keys() {
                     if k.as_ref() != "__value__" && k.as_ref() != "__error_data__" {
                         names.push(k.clone());
@@ -1148,25 +1158,11 @@ impl Engine {
             );
             b.props.insert(
                 Rc::from("name"),
-                Property {
-                    value: Value::String(Rc::from(name)),
-                    writable: true,
-                    enumerable: false,
-                    configurable: true,
-                    get: None,
-                    set: None,
-                },
+                Property::data(Value::String(Rc::from(name)), true, false, true),
             );
             b.props.insert(
                 Rc::from("message"),
-                Property {
-                    value: Value::String(Rc::from(msg)),
-                    writable: true,
-                    enumerable: false,
-                    configurable: true,
-                    get: None,
-                    set: None,
-                },
+                Property::data(Value::String(Rc::from(msg)), true, false, true),
             );
         }
         Value::Object(obj)

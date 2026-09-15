@@ -4,28 +4,14 @@ use core::cell::RefCell;
 use crate::error::Error;
 use crate::interpreter::Engine;
 use crate::value::{
-    ArrayData, native, MapData, Object, Property, SetData, Value, WeakMapData, WeakSetData,
+    ArrayData, native, MapData, Object, Property, SetData, Value, WeakKey, WeakMapData,
+    WeakSetData,
 };
 
 use super::helpers::proto_method;
 
-/// SameValueZero: used by `Map`/`Set` key comparison (`+0`/`-0` equal, `NaN`
-/// equals `NaN`).
-fn same_value_zero(a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        (Value::Number(x), Value::Number(y)) => {
-            if x.is_nan() && y.is_nan() {
-                true
-            } else {
-                x == y
-            }
-        }
-        _ => Value::strict_eq(a, b),
-    }
-}
-
 fn map_find(data: &MapData, key: &Value) -> Option<usize> {
-    data.entries.iter().position(|(k, _)| same_value_zero(k, key))
+    data.find(key)
 }
 
 // --- Map ---
@@ -41,7 +27,7 @@ pub(crate) fn map_ctor(
             "TypeError: Map constructor must be called with 'new'",
         ))));
     }
-    let m = Rc::new(RefCell::new(MapData { entries: Vec::new() }));
+    let m = Rc::new(RefCell::new(MapData::new()));
     e.register_map(&m);
     let v = Value::Map(m.clone());
     if let Some(arg) = a.first() {
@@ -56,7 +42,9 @@ pub(crate) fn map_ctor(
                     if let Some(i) = map_find(&data, &key) {
                         data.entries[i].1 = val;
                     } else {
-                        data.entries.push((key, val));
+                        let i = data.entries.len();
+                        data.entries.push((key.clone(), val));
+                        data.index.insert(crate::value::ValueKey::from_value(&key), i);
                     }
                 }
             }
@@ -80,7 +68,9 @@ pub(crate) fn map_set(_e: &Engine, this: &Value, a: &[Value], _c: bool) -> Resul
     if let Some(i) = map_find(&data, &key) {
         data.entries[i].1 = val;
     } else {
-        data.entries.push((key, val));
+        let i = data.entries.len();
+        data.entries.push((key.clone(), val));
+        data.index.insert(crate::value::ValueKey::from_value(&key), i);
     }
     Ok(this.clone())
 }
@@ -97,10 +87,8 @@ pub(crate) fn map_get(_e: &Engine, this: &Value, a: &[Value], _c: bool) -> Resul
     let key = a.first().cloned().unwrap_or(Value::Undefined);
     let data = m.borrow();
     Ok(data
-        .entries
-        .iter()
-        .find(|(k, _)| same_value_zero(k, &key))
-        .map(|(_, v)| v.clone())
+        .find(&key)
+        .and_then(|i| data.entries.get(i).map(|(_, v)| v.clone()))
         .unwrap_or(Value::Undefined))
 }
 
@@ -115,7 +103,7 @@ pub(crate) fn map_has(_e: &Engine, this: &Value, a: &[Value], _c: bool) -> Resul
     };
     let key = a.first().cloned().unwrap_or(Value::Undefined);
     let data = m.borrow();
-    Ok(Value::Boolean(data.entries.iter().any(|(k, _)| same_value_zero(k, &key))))
+    Ok(Value::Boolean(data.find(&key).is_some()))
 }
 
 pub(crate) fn map_delete(_e: &Engine, this: &Value, a: &[Value], _c: bool) -> Result<Value, Error> {
@@ -131,6 +119,7 @@ pub(crate) fn map_delete(_e: &Engine, this: &Value, a: &[Value], _c: bool) -> Re
     let mut data = m.borrow_mut();
     if let Some(i) = map_find(&data, &key) {
         data.entries.remove(i);
+        data.rebuild_index();
         Ok(Value::Boolean(true))
     } else {
         Ok(Value::Boolean(false))
@@ -140,6 +129,7 @@ pub(crate) fn map_delete(_e: &Engine, this: &Value, a: &[Value], _c: bool) -> Re
 pub(crate) fn map_clear(_e: &Engine, this: &Value, _a: &[Value], _c: bool) -> Result<Value, Error> {
     if let Value::Map(m) = this {
         m.borrow_mut().entries.clear();
+        m.borrow_mut().index.clear();
     }
     Ok(Value::Undefined)
 }
@@ -167,7 +157,7 @@ pub(crate) fn map_for_each(e: &Engine, this: &Value, a: &[Value], _c: bool) -> R
 // --- Set ---
 
 fn set_find(data: &SetData, val: &Value) -> Option<usize> {
-    data.entries.iter().position(|x| same_value_zero(x, val))
+    data.find(val)
 }
 
 pub(crate) fn set_ctor(
@@ -181,7 +171,7 @@ pub(crate) fn set_ctor(
             "TypeError: Set constructor must be called with 'new'",
         ))));
     }
-    let s = Rc::new(RefCell::new(SetData { entries: Vec::new() }));
+    let s = Rc::new(RefCell::new(SetData::new()));
     e.register_set(&s);
     let v = Value::Set(s.clone());
     if let Some(arg) = a.first() {
@@ -190,7 +180,9 @@ pub(crate) fn set_ctor(
             let mut data = s.borrow_mut();
             for item in items {
                 if set_find(&data, &item).is_none() {
-                    data.entries.push(item);
+                    let i = data.entries.len();
+                    data.entries.push(item.clone());
+                    data.index.insert(crate::value::ValueKey::from_value(&item), i);
                 }
             }
         }
@@ -210,7 +202,9 @@ pub(crate) fn set_add(_e: &Engine, this: &Value, a: &[Value], _c: bool) -> Resul
     let val = a.first().cloned().unwrap_or(Value::Undefined);
     let mut data = s.borrow_mut();
     if set_find(&data, &val).is_none() {
-        data.entries.push(val);
+        let i = data.entries.len();
+        data.entries.push(val.clone());
+        data.index.insert(crate::value::ValueKey::from_value(&val), i);
     }
     Ok(this.clone())
 }
@@ -226,7 +220,7 @@ pub(crate) fn set_has(_e: &Engine, this: &Value, a: &[Value], _c: bool) -> Resul
     };
     let val = a.first().cloned().unwrap_or(Value::Undefined);
     let data = s.borrow();
-    Ok(Value::Boolean(data.entries.iter().any(|x| same_value_zero(x, &val))))
+    Ok(Value::Boolean(data.find(&val).is_some()))
 }
 
 pub(crate) fn set_delete(_e: &Engine, this: &Value, a: &[Value], _c: bool) -> Result<Value, Error> {
@@ -242,6 +236,7 @@ pub(crate) fn set_delete(_e: &Engine, this: &Value, a: &[Value], _c: bool) -> Re
     let mut data = s.borrow_mut();
     if let Some(i) = set_find(&data, &val) {
         data.entries.remove(i);
+        data.rebuild_index();
         Ok(Value::Boolean(true))
     } else {
         Ok(Value::Boolean(false))
@@ -251,6 +246,7 @@ pub(crate) fn set_delete(_e: &Engine, this: &Value, a: &[Value], _c: bool) -> Re
 pub(crate) fn set_clear(_e: &Engine, this: &Value, _a: &[Value], _c: bool) -> Result<Value, Error> {
     if let Value::Set(s) = this {
         s.borrow_mut().entries.clear();
+        s.borrow_mut().index.clear();
     }
     Ok(Value::Undefined)
 }
@@ -299,6 +295,11 @@ pub(crate) fn weakmap_ctor(
                     let elems = arr.borrow();
                     let key = elems.elems.first().cloned().unwrap_or(Value::Undefined);
                     let val = elems.elems.get(1).cloned().unwrap_or(Value::Undefined);
+                    let key = WeakKey::from_value(&key).ok_or_else(|| {
+                        Error::Runtime(Value::String(Rc::from(
+                            "TypeError: WeakMap key must be an object",
+                        )))
+                    })?;
                     w.borrow_mut().entries.push((key, val));
                 }
             }
@@ -318,8 +319,9 @@ pub(crate) fn weakmap_set(_e: &Engine, this: &Value, a: &[Value], _c: bool) -> R
     };
     let key = a.first().cloned().unwrap_or(Value::Undefined);
     let val = a.get(1).cloned().unwrap_or(Value::Undefined);
+    let key = WeakKey::from_value(&key).ok_or_else(|| Error::Runtime(Value::String(Rc::from("TypeError: WeakMap key must be an object"))))?;
     let mut data = w.borrow_mut();
-    if let Some(i) = data.entries.iter().position(|(k, _)| same_value_zero(k, &key)) {
+    if let Some(i) = data.entries.iter().position(|(k, _)| k.id() == key.id()) {
         data.entries[i].1 = val;
     } else {
         data.entries.push((key, val));
@@ -341,7 +343,7 @@ pub(crate) fn weakmap_get(_e: &Engine, this: &Value, a: &[Value], _c: bool) -> R
     Ok(data
         .entries
         .iter()
-        .find(|(k, _)| same_value_zero(k, &key))
+        .find(|(k, _)| k.matches(&key))
         .map(|(_, v)| v.clone())
         .unwrap_or(Value::Undefined))
 }
@@ -357,7 +359,7 @@ pub(crate) fn weakmap_has(_e: &Engine, this: &Value, a: &[Value], _c: bool) -> R
     };
     let key = a.first().cloned().unwrap_or(Value::Undefined);
     let data = w.borrow();
-    Ok(Value::Boolean(data.entries.iter().any(|(k, _)| same_value_zero(k, &key))))
+    Ok(Value::Boolean(data.entries.iter().any(|(k, _)| k.matches(&key))))
 }
 
 pub(crate) fn weakmap_delete(
@@ -376,7 +378,7 @@ pub(crate) fn weakmap_delete(
     };
     let key = a.first().cloned().unwrap_or(Value::Undefined);
     let mut data = w.borrow_mut();
-    if let Some(i) = data.entries.iter().position(|(k, _)| same_value_zero(k, &key)) {
+    if let Some(i) = data.entries.iter().position(|(k, _)| k.matches(&key)) {
         data.entries.remove(i);
         Ok(Value::Boolean(true))
     } else {
@@ -405,8 +407,13 @@ pub(crate) fn weakset_ctor(
             let items = e.iterable_values(arg)?;
             let mut data = w.borrow_mut();
             for item in items {
-                if data.entries.iter().position(|x| same_value_zero(x, &item)).is_none() {
-                    data.entries.push(item);
+                let key = WeakKey::from_value(&item).ok_or_else(|| {
+                    Error::Runtime(Value::String(Rc::from(
+                        "TypeError: WeakSet value must be an object",
+                    )))
+                })?;
+                if data.entries.iter().position(|x| x.id() == key.id()).is_none() {
+                    data.entries.push(key);
                 }
             }
         }
@@ -424,8 +431,9 @@ pub(crate) fn weakset_add(_e: &Engine, this: &Value, a: &[Value], _c: bool) -> R
         }
     };
     let val = a.first().cloned().unwrap_or(Value::Undefined);
+    let val = WeakKey::from_value(&val).ok_or_else(|| Error::Runtime(Value::String(Rc::from("TypeError: WeakSet value must be an object"))))?;
     let mut data = w.borrow_mut();
-    if data.entries.iter().position(|x| same_value_zero(x, &val)).is_none() {
+    if data.entries.iter().position(|x| x.id() == val.id()).is_none() {
         data.entries.push(val);
     }
     Ok(this.clone())
@@ -442,7 +450,7 @@ pub(crate) fn weakset_has(_e: &Engine, this: &Value, a: &[Value], _c: bool) -> R
     };
     let val = a.first().cloned().unwrap_or(Value::Undefined);
     let data = w.borrow();
-    Ok(Value::Boolean(data.entries.iter().any(|x| same_value_zero(x, &val))))
+    Ok(Value::Boolean(data.entries.iter().any(|x| x.matches(&val))))
 }
 
 pub(crate) fn weakset_delete(
@@ -461,7 +469,7 @@ pub(crate) fn weakset_delete(
     };
     let val = a.first().cloned().unwrap_or(Value::Undefined);
     let mut data = w.borrow_mut();
-    if let Some(i) = data.entries.iter().position(|x| same_value_zero(x, &val)) {
+    if let Some(i) = data.entries.iter().position(|x| x.matches(&val)) {
         data.entries.remove(i);
         Ok(Value::Boolean(true))
     } else {

@@ -1,48 +1,48 @@
 use alloc::rc::Rc;
-use alloc::collections::{BTreeMap, BTreeSet};
 use core::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 
 use crate::value::Value;
 
 /// A lexical scope. Variable resolution walks the `outer` chain.
 #[derive(Debug, Clone)]
 pub struct Env {
-    pub vars: BTreeMap<Rc<str>, Value>,
+    pub vars: HashMap<Rc<str>, Value>,
     pub outer: Option<Rc<RefCell<Env>>>,
     /// Whether `var` declarations bind inside this scope (`true` for function
     /// and global scopes) rather than being hoisted to a containing function.
     pub function_scope: bool,
     /// Names bound as `const` in this scope (reassignment is a TypeError).
-    pub constants: BTreeSet<Rc<str>>,
+    pub constants: HashSet<Rc<str>>,
 }
 
 impl Env {
     pub fn new_global() -> Self {
         Env {
-            vars: BTreeMap::new(),
+            vars: HashMap::new(),
             outer: None,
             function_scope: true,
-            constants: BTreeSet::new(),
+            constants: HashSet::new(),
         }
     }
 
     /// Create a new function (or catch-free) scope whose `var`s bind locally.
     pub fn new_child(outer: Rc<RefCell<Env>>) -> Self {
         Env {
-            vars: BTreeMap::new(),
+            vars: HashMap::new(),
             outer: Some(outer),
             function_scope: true,
-            constants: BTreeSet::new(),
+            constants: HashSet::new(),
         }
     }
 
     /// Create a block scope (`let`/`const` bind here; `var` climbs out).
     pub fn new_block(outer: Rc<RefCell<Env>>) -> Self {
         Env {
-            vars: BTreeMap::new(),
+            vars: HashMap::new(),
             outer: Some(outer),
             function_scope: false,
-            constants: BTreeSet::new(),
+            constants: HashSet::new(),
         }
     }
 

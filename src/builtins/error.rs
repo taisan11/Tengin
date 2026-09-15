@@ -84,14 +84,7 @@ fn define_own_non_enumerable(target: &Value, key: &str, value: Value) {
     if let Value::Object(o) = target {
         o.borrow_mut().props.insert(
             Rc::from(key),
-            Property {
-                value,
-                writable: true,
-                enumerable: false,
-                configurable: true,
-                get: None,
-                set: None,
-            },
+            Property::data(value, true, false, true),
         );
     }
 }

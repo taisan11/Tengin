@@ -1,5 +1,6 @@
 use alloc::rc::Rc;
 use core::cell::{Cell, RefCell};
+use std::collections::HashSet;
 
 use crate::ast::*;
 use crate::environment::Env;
@@ -13,7 +14,7 @@ mod jobs;
 mod object;
 pub(crate) mod ops;
 
-use self::gc::{GcHeap, GC_THRESHOLD};
+use self::gc::{GcHeap, GC_THRESHOLD, MAJOR_AFTER_MINOR, NURSERY_THRESHOLD};
 pub(crate) use self::jobs::{Job, PromiseCapability, TimerEntry};
 
 pub struct Engine {
@@ -44,9 +45,9 @@ pub struct Engine {
     /// Pending spec jobs (promise reactions + async continuations).
     pub(crate) job_queue: RefCell<alloc::collections::VecDeque<Job>>,
     /// Pending timers (macrotasks) ordered by virtual deadline.
-    pub(crate) timers: RefCell<alloc::vec::Vec<TimerEntry>>,
+    pub(crate) timers: RefCell<std::collections::BinaryHeap<TimerEntry>>,
     /// Ids cancelled while their timer was in flight (checked on reschedule).
-    pub(crate) cancelled_timers: RefCell<alloc::vec::Vec<u64>>,
+    pub(crate) cancelled_timers: RefCell<HashSet<u64>>,
     /// Next timer id.
     pub(crate) next_timer_id: Cell<u64>,
     /// Virtual clock in milliseconds (advanced only by timer pumping).
@@ -69,6 +70,9 @@ pub struct Engine {
     pub(crate) uri_error_proto: Rc<RefCell<Object>>,
     /// Per-realm registry for `Symbol.for(key)`.
     pub(crate) symbol_registry: RefCell<std::collections::HashMap<Rc<str>, Rc<crate::value::SymbolData>>>,
+    /// Interned property/binding names. Reusing the same `Rc<str>` avoids a
+    /// fresh allocation on every dynamic property write.
+    pub(crate) key_intern: RefCell<std::collections::HashMap<Rc<str>, Rc<str>>>,
     /// The garbage-collector heap (weakly-registered live cells).
     pub(crate) gc: RefCell<GcHeap>,
     /// Nesting depth of `Engine::eval`; collection only runs at the top level.
@@ -183,8 +187,8 @@ impl Engine {
             async_function_prototype,
             yield_sink: RefCell::new(None),
             job_queue: RefCell::new(alloc::collections::VecDeque::new()),
-            timers: RefCell::new(alloc::vec::Vec::new()),
-            cancelled_timers: RefCell::new(alloc::vec::Vec::new()),
+            timers: RefCell::new(std::collections::BinaryHeap::new()),
+            cancelled_timers: RefCell::new(HashSet::new()),
             next_timer_id: Cell::new(1),
             now_ms: Cell::new(0),
             async_depth: Cell::new(0),
@@ -198,6 +202,7 @@ impl Engine {
             eval_error_proto,
             uri_error_proto,
             symbol_registry: RefCell::new(std::collections::HashMap::new()),
+            key_intern: RefCell::new(std::collections::HashMap::new()),
             gc: RefCell::new(GcHeap::default()),
             eval_depth: Cell::new(0),
             strict: Cell::new(false),
@@ -225,10 +230,14 @@ impl Engine {
     }
 
     pub fn register_global(&mut self, name: &str, val: Value) {
+        if let Value::NativeFunction(native) = &val {
+            self.register_native(native);
+        }
+        let name_rc = self.intern_key(name);
         self.global_env
             .borrow_mut()
             .vars
-            .insert(Rc::from(name), val.clone());
+            .insert(name_rc.clone(), val.clone());
         let prop = match name {
             // These are non-writable, non-enumerable, non-configurable globals.
             "undefined" | "NaN" | "Infinity" => Property::constant(val),
@@ -239,7 +248,19 @@ impl Engine {
         self.global_object
             .borrow_mut()
             .props
-            .insert(Rc::from(name), prop);
+            .insert(name_rc, prop);
+    }
+
+    /// Return a shared atom for a property or binding name.
+    pub(crate) fn intern_key(&self, name: &str) -> Rc<str> {
+        if let Some(existing) = self.key_intern.borrow().get(name) {
+            return existing.clone();
+        }
+        let atom: Rc<str> = Rc::from(name);
+        self.key_intern
+            .borrow_mut()
+            .insert(atom.clone(), atom.clone());
+        atom
     }
 
     pub fn parse_source(&self, src: &str) -> Result<Program> {
@@ -248,6 +269,13 @@ impl Engine {
 
     pub fn eval(&self, src: &str) -> Result<Value> {
         let prog = parser::parse(src)?;
+        self.eval_program(&prog)
+    }
+
+    /// Evaluate an already converted program. Callers that execute the same
+    /// source repeatedly can parse once and reuse the immutable AST, avoiding
+    /// Oxc parsing and lowering allocations on every invocation.
+    pub fn eval_program(&self, prog: &Program) -> Result<Value> {
         // Class private names are not implemented; a body that references a
         // private field is a SyntaxError (the private name is never in scope).
         if prog.has_private_member() {
@@ -292,8 +320,17 @@ impl Engine {
                 Err(Error::Runtime(v)) => Some(v),
                 _ => None,
             };
-            if self.gc_pressure.get() > GC_THRESHOLD {
+            let (nursery_len, minor_collections) = {
+                let gc = self.gc.borrow();
+                (gc.nursery_len, gc.minor_collections)
+            };
+            if self.gc_pressure.get() >= GC_THRESHOLD
+                || minor_collections >= MAJOR_AFTER_MINOR
+                    && nursery_len >= NURSERY_THRESHOLD / 2
+            {
                 self.collect_with(extra);
+            } else if nursery_len >= NURSERY_THRESHOLD {
+                self.collect_minor_with(extra);
             }
         }
         result
@@ -332,6 +369,7 @@ impl Drop for Engine {
         self.active_new_target.borrow_mut().take();
         self.cap_records.borrow_mut().clear();
         self.symbol_registry.borrow_mut().clear();
+        self.key_intern.borrow_mut().clear();
 
         let prototypes = [
             &self.function_prototype,
@@ -370,8 +408,7 @@ impl Drop for Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::vec::Vec;
-    use crate::value::{MapData, Property, SetData};
+    use crate::value::{MapData, Property, SetData, WeakKey, WeakMapData, Value};
 
     #[test]
     fn gc_collects_unreachable_cycle() {
@@ -389,6 +426,62 @@ mod tests {
             weak.upgrade().is_none(),
             "unreachable cycle was not collected"
         );
+    }
+
+    #[test]
+    fn generational_gc_promotes_survivors_and_defers_tenured_sweep() {
+        let engine = Engine::new();
+        let live = engine.new_object();
+        let live_weak = Rc::downgrade(&live);
+        live.borrow_mut().props.insert(
+            Rc::from("self"),
+            Property::new(Value::Object(live.clone())),
+        );
+        engine
+            .global_env
+            .borrow_mut()
+            .vars
+            .insert(Rc::from("kept"), Value::Object(live.clone()));
+        let young_dead = engine.new_object();
+        let young_dead_weak = Rc::downgrade(&young_dead);
+        young_dead.borrow_mut().props.insert(
+            Rc::from("self"),
+            Property::new(Value::Object(young_dead.clone())),
+        );
+        drop(young_dead);
+
+        // The first minor collection promotes the reachable object.
+        engine.collect_minor();
+        assert!(live_weak.upgrade().is_some());
+        assert!(young_dead_weak.upgrade().is_none());
+
+        // Remove the only root. A minor collection must leave the old cycle
+        // alone; a major collection is what finally breaks it.
+        engine.global_env.borrow_mut().vars.remove("kept");
+        drop(live);
+        engine.collect_minor();
+        assert!(live_weak.upgrade().is_some());
+        engine.collect_garbage();
+        assert!(live_weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn synchronous_call_path_preserves_call_semantics() {
+        let engine = Engine::new();
+        assert_eq!(engine.eval("function f(a,b){ return this.x + a + b; } ({x: 1, f}).f(2, 3)").unwrap(), Value::Number(6.0));
+        assert_eq!(engine.eval("function C(x){ this.x = x; } new C(7).x").unwrap(), Value::Number(7.0));
+    }
+
+    #[test]
+    fn sparse_array_iterator_is_lazy() {
+        let engine = Engine::new();
+        let array = engine.new_array(Vec::new());
+        array.borrow_mut().set_index(10_000_000, Value::Number(9.0));
+        let mut iter = engine.array_values_iter(array);
+        assert_eq!(iter.next(), Some(Value::Undefined));
+        assert_eq!(iter.nth(9_999_998), Some(Value::Undefined));
+        assert_eq!(iter.next(), Some(Value::Number(9.0)));
+        assert_eq!(iter.next(), None);
     }
 
     #[test]
@@ -440,7 +533,7 @@ mod tests {
     fn gc_collects_unreachable_map_cycle() {
         let engine = Engine::new();
         // A Map whose only reference is its own entry is an unreachable cycle.
-        let m = Rc::new(RefCell::new(MapData { entries: Vec::new() }));
+        let m = Rc::new(RefCell::new(MapData::new()));
         engine.register_map(&m);
         m.borrow_mut()
             .entries
@@ -454,13 +547,71 @@ mod tests {
     #[test]
     fn gc_collects_unreachable_set() {
         let engine = Engine::new();
-        let s = Rc::new(RefCell::new(SetData { entries: Vec::new() }));
+        let s = Rc::new(RefCell::new(SetData::new()));
         engine.register_set(&s);
         s.borrow_mut().entries.push(Value::Set(s.clone()));
         let weak = Rc::downgrade(&s);
         drop(s);
         engine.collect_garbage();
         assert!(weak.upgrade().is_none(), "unreachable Set was not collected");
+    }
+
+    #[test]
+    fn indexed_collections_preserve_same_value_zero() {
+        let e = Engine::new();
+        e.eval("var m = new Map(); m.set(NaN, 1); m.set(-0, 2);")
+            .unwrap();
+        assert_eq!(
+            e.eval("JSON.stringify([m.get(NaN), m.get(+0), m.size])").unwrap(),
+            Value::String(Rc::from("[1,2,2]"))
+        );
+        assert_eq!(
+            e.eval("var s = new Set(); s.add(NaN); s.add(NaN); s.add(-0); s.add(+0); s.size")
+                .unwrap(),
+            Value::Number(2.0)
+        );
+    }
+
+    #[test]
+    fn sparse_array_does_not_expand_dense_storage() {
+        let e = Engine::new();
+        e.eval("var a = []; a[1000000000] = 7;").unwrap();
+        assert_eq!(e.eval("a.length").unwrap(), Value::Number(1000000001.0));
+        assert_eq!(e.eval("a[1000000000]").unwrap(), Value::Number(7.0));
+        assert_eq!(e.eval("a[999999999]").unwrap(), Value::Undefined);
+    }
+
+    #[test]
+    fn eval_program_reuses_converted_ast() {
+        let e = Engine::new();
+        let program = e.parse_source("1 + 2").unwrap();
+        assert_eq!(e.eval_program(&program).unwrap(), Value::Number(3.0));
+        assert_eq!(e.eval_program(&program).unwrap(), Value::Number(3.0));
+    }
+
+    #[test]
+    fn weak_collections_require_object_keys() {
+        let e = Engine::new();
+        assert!(e.eval("new WeakMap().set(1, 2)").is_err());
+        assert!(e.eval("new WeakSet().add(1)").is_err());
+        assert_eq!(
+            e.eval("var k = {}; var w = new WeakMap(); w.set(k, 3); w.get(k)").unwrap(),
+            Value::Number(3.0)
+        );
+    }
+
+    #[test]
+    fn gc_prunes_dead_weakmap_keys() {
+        let e = Engine::new();
+        let wm = Rc::new(RefCell::new(WeakMapData { entries: Vec::new() }));
+        e.register_weakmap(&wm);
+        let key = e.new_object();
+        wm.borrow_mut()
+            .entries
+            .push((WeakKey::from_value(&Value::Object(key.clone())).unwrap(), Value::Number(1.0)));
+        drop(key);
+        e.collect_garbage();
+        assert!(wm.borrow().entries.is_empty());
     }
 
     #[test]

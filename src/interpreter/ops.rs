@@ -163,7 +163,7 @@ pub(crate) fn has_property(key: &str, base: &Value) -> bool {
             key == "length"
                 || key
                     .parse::<usize>()
-                    .map(|i| i < a.borrow().elems.len())
+                    .map(|i| i < a.borrow().logical_len() && a.borrow().get_index(i).is_some())
                     .unwrap_or(false)
         }
         Value::String(_) => key == "length",

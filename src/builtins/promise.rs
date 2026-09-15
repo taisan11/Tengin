@@ -509,53 +509,25 @@ fn aggregate_error_ctor(
         let mut b = o.borrow_mut();
         b.props.insert(
             Rc::from("name"),
-            Property {
-                value: Value::String(Rc::from("AggregateError")),
-                writable: true,
-                enumerable: false,
-                configurable: true,
-                get: None,
-                set: None,
-            },
+            Property::data(Value::String(Rc::from("AggregateError")), true, false, true),
         );
         let msg = a.get(1).cloned().unwrap_or(Value::Undefined);
         if !matches!(msg, Value::Undefined) {
             if let Ok(s) = e.to_string_fallible(&msg) {
                 b.props.insert(
                     Rc::from("message"),
-                    Property {
-                        value: Value::String(s),
-                        writable: true,
-                        enumerable: false,
-                        configurable: true,
-                        get: None,
-                        set: None,
-                    },
+                    Property::data(Value::String(s), true, false, true),
                 );
             }
         } else {
             b.props.insert(
                 Rc::from("message"),
-                Property {
-                    value: Value::String(Rc::from("")),
-                    writable: true,
-                    enumerable: false,
-                    configurable: true,
-                    get: None,
-                    set: None,
-                },
+                Property::data(Value::String(Rc::from("")), true, false, true),
             );
         }
         b.props.insert(
             Rc::from("errors"),
-            Property {
-                value: Value::Array(e.new_array(errs)),
-                writable: true,
-                enumerable: false,
-                configurable: true,
-                get: None,
-                set: None,
-            },
+            Property::data(Value::Array(e.new_array(errs)), true, false, true),
         );
     }
     Ok(target)
@@ -621,25 +593,11 @@ pub(crate) fn register_promise(engine: &mut Engine) {
         Rc::new(RefCell::new(Object::with_proto(engine.error_prototype.clone())));
     agg_proto.borrow_mut().props.insert(
         Rc::from("name"),
-        Property {
-            value: Value::String(Rc::from("AggregateError")),
-            writable: true,
-            enumerable: false,
-            configurable: true,
-            get: None,
-            set: None,
-        },
+        Property::data(Value::String(Rc::from("AggregateError")), true, false, true),
     );
     agg_proto.borrow_mut().props.insert(
         Rc::from("message"),
-        Property {
-            value: Value::String(Rc::from("")),
-            writable: true,
-            enumerable: false,
-            configurable: true,
-            get: None,
-            set: None,
-        },
+        Property::data(Value::String(Rc::from("")), true, false, true),
     );
     let agg_ctor = reg_ctor(engine, "AggregateError", aggregate_error_ctor, agg_proto.clone());
     proto_data(&agg_proto, "constructor", agg_ctor.clone());

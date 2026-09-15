@@ -2,6 +2,8 @@ use alloc::rc::{Rc, Weak};
 use alloc::vec::Vec;
 use alloc::collections::BTreeMap;
 use core::cell::RefCell;
+use std::collections::HashMap;
+use core::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::ast::Stmt;
@@ -267,24 +269,166 @@ impl PromiseData {
 #[derive(Debug, Clone)]
 pub struct MapData {
     pub entries: Vec<(Value, Value)>,
+    /// Average O(1) lookup index. The entries vector remains authoritative so
+    /// iteration order stays insertion-ordered.
+    pub index: HashMap<ValueKey, usize>,
+}
+
+/// Hashable identity used by Map/Set. Object-like values use their allocation
+/// identity; primitive values use their SameValueZero representation.
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub enum ValueKey {
+    Undefined,
+    Null,
+    Boolean(bool),
+    Number(u64),
+    String(Rc<str>),
+    BigInt(Rc<str>),
+    Symbol(Rc<str>),
+    Heap(*const ()),
+}
+
+/// Non-owning key used by WeakMap/WeakSet. The raw identity lets lookups avoid
+/// upgrading the weak pointer; `is_alive` is used to prune dead entries.
+#[derive(Debug, Clone)]
+pub enum WeakKey {
+    Object(Weak<RefCell<Object>>, *const ()),
+    Array(Weak<RefCell<ArrayData>>, *const ()),
+    Function(Weak<RefCell<Function>>, *const ()),
+    NativeFunction(Weak<RefCell<NativeFunctionData>>, *const ()),
+    Regex(Weak<RegexData>, *const ()),
+    Map(Weak<RefCell<MapData>>, *const ()),
+    Set(Weak<RefCell<SetData>>, *const ()),
+    WeakMap(Weak<RefCell<WeakMapData>>, *const ()),
+    WeakSet(Weak<RefCell<WeakSetData>>, *const ()),
+    Promise(Weak<RefCell<PromiseData>>, *const ()),
+}
+
+impl WeakKey {
+    pub fn from_value(v: &Value) -> Option<Self> {
+        Some(match v {
+            Value::Object(x) => Self::Object(Rc::downgrade(x), Rc::as_ptr(x) as *const ()),
+            Value::Array(x) => Self::Array(Rc::downgrade(x), Rc::as_ptr(x) as *const ()),
+            Value::Function(x) => Self::Function(Rc::downgrade(x), Rc::as_ptr(x) as *const ()),
+            Value::NativeFunction(x) => Self::NativeFunction(Rc::downgrade(x), Rc::as_ptr(x) as *const ()),
+            Value::Regex(x) => Self::Regex(Rc::downgrade(x), Rc::as_ptr(x) as *const ()),
+            Value::Map(x) => Self::Map(Rc::downgrade(x), Rc::as_ptr(x) as *const ()),
+            Value::Set(x) => Self::Set(Rc::downgrade(x), Rc::as_ptr(x) as *const ()),
+            Value::WeakMap(x) => Self::WeakMap(Rc::downgrade(x), Rc::as_ptr(x) as *const ()),
+            Value::WeakSet(x) => Self::WeakSet(Rc::downgrade(x), Rc::as_ptr(x) as *const ()),
+            Value::Promise(x) => Self::Promise(Rc::downgrade(x), Rc::as_ptr(x) as *const ()),
+            _ => return None,
+        })
+    }
+    pub fn id(&self) -> *const () {
+        match self {
+            Self::Object(_, p) | Self::Array(_, p) | Self::Function(_, p)
+            | Self::NativeFunction(_, p) | Self::Regex(_, p) | Self::Map(_, p)
+            | Self::Set(_, p) | Self::WeakMap(_, p) | Self::WeakSet(_, p)
+            | Self::Promise(_, p) => *p,
+        }
+    }
+    pub fn matches(&self, v: &Value) -> bool {
+        Self::from_value(v).map(|k| self.id() == k.id()).unwrap_or(false)
+    }
+    pub fn is_alive(&self) -> bool {
+        match self {
+            Self::Object(w, _) => w.strong_count() > 0,
+            Self::Array(w, _) => w.strong_count() > 0,
+            Self::Function(w, _) => w.strong_count() > 0,
+            Self::NativeFunction(w, _) => w.strong_count() > 0,
+            Self::Regex(w, _) => w.strong_count() > 0,
+            Self::Map(w, _) => w.strong_count() > 0,
+            Self::Set(w, _) => w.strong_count() > 0,
+            Self::WeakMap(w, _) => w.strong_count() > 0,
+            Self::WeakSet(w, _) => w.strong_count() > 0,
+            Self::Promise(w, _) => w.strong_count() > 0,
+        }
+    }
+}
+
+impl ValueKey {
+    pub fn from_value(v: &Value) -> Self {
+        match v {
+            Value::Undefined => Self::Undefined,
+            Value::Null => Self::Null,
+            Value::Boolean(b) => Self::Boolean(*b),
+            Value::Number(n) => {
+                // SameValueZero treats NaN as equal to itself and +0/-0 as
+                // equal, so canonicalize both before hashing.
+                let bits = if n.is_nan() {
+                    f64::NAN.to_bits()
+                } else if *n == 0.0 {
+                    0
+                } else {
+                    n.to_bits()
+                };
+                Self::Number(bits)
+            }
+            Value::String(s) => Self::String(s.clone()),
+            Value::BigInt(s) => Self::BigInt(s.clone()),
+            Value::Symbol(s) => Self::Symbol(s.id.clone()),
+            Value::Object(x) => Self::Heap(Rc::as_ptr(x) as *const ()),
+            Value::Array(x) => Self::Heap(Rc::as_ptr(x) as *const ()),
+            Value::Function(x) => Self::Heap(Rc::as_ptr(x) as *const ()),
+            Value::NativeFunction(x) => Self::Heap(Rc::as_ptr(x) as *const ()),
+            Value::Regex(x) => Self::Heap(Rc::as_ptr(x) as *const ()),
+            Value::Map(x) => Self::Heap(Rc::as_ptr(x) as *const ()),
+            Value::Set(x) => Self::Heap(Rc::as_ptr(x) as *const ()),
+            Value::WeakMap(x) => Self::Heap(Rc::as_ptr(x) as *const ()),
+            Value::WeakSet(x) => Self::Heap(Rc::as_ptr(x) as *const ()),
+            Value::Promise(x) => Self::Heap(Rc::as_ptr(x) as *const ()),
+        }
+    }
+}
+
+impl MapData {
+    pub fn new() -> Self {
+        Self { entries: Vec::new(), index: HashMap::new() }
+    }
+    pub fn find(&self, key: &Value) -> Option<usize> {
+        self.index.get(&ValueKey::from_value(key)).copied()
+    }
+    pub fn rebuild_index(&mut self) {
+        self.index.clear();
+        for (i, (k, _)) in self.entries.iter().enumerate() {
+            self.index.insert(ValueKey::from_value(k), i);
+        }
+    }
 }
 
 /// Backing storage for a `Set`.
 #[derive(Debug, Clone)]
 pub struct SetData {
     pub entries: Vec<Value>,
+    pub index: HashMap<ValueKey, usize>,
+}
+
+impl SetData {
+    pub fn new() -> Self {
+        Self { entries: Vec::new(), index: HashMap::new() }
+    }
+    pub fn find(&self, value: &Value) -> Option<usize> {
+        self.index.get(&ValueKey::from_value(value)).copied()
+    }
+    pub fn rebuild_index(&mut self) {
+        self.index.clear();
+        for (i, v) in self.entries.iter().enumerate() {
+            self.index.insert(ValueKey::from_value(v), i);
+        }
+    }
 }
 
 /// Backing storage for a `WeakMap`.
 #[derive(Debug, Clone)]
 pub struct WeakMapData {
-    pub entries: Vec<(Value, Value)>,
+    pub entries: Vec<(WeakKey, Value)>,
 }
 
 /// Backing storage for a `WeakSet`.
 #[derive(Debug, Clone)]
 pub struct WeakSetData {
-    pub entries: Vec<Value>,
+    pub entries: Vec<WeakKey>,
 }
 
 /// Backing data for a regular expression literal.
@@ -424,10 +568,9 @@ pub type NativeFn = fn(
     bool,
 ) -> Result<Value, crate::error::Error>;
 
-/// A property slot on a JavaScript object.
+/// Fields shared by data and accessor property descriptors.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct Property {
+pub struct PropertyFields {
     pub value: Value,
     pub writable: bool,
     pub enumerable: bool,
@@ -438,81 +581,110 @@ pub struct Property {
     pub set: Option<Value>,
 }
 
+/// A property slot on a JavaScript object.
+///
+/// Keeping data and accessor descriptors as distinct enum variants avoids
+/// carrying accessor-only state on every ordinary data property. `Deref` is
+/// provided for source compatibility with the existing descriptor consumers;
+/// new code should prefer the descriptor helpers below.
+#[derive(Debug, Clone)]
+pub enum Property {
+    Data(PropertyFields),
+    Accessor(PropertyFields),
+}
+
+impl Deref for Property {
+    type Target = PropertyFields;
+    fn deref(&self) -> &Self::Target {
+        match self { Property::Data(fields) | Property::Accessor(fields) => fields }
+    }
+}
+
+impl DerefMut for Property {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self { Property::Data(fields) | Property::Accessor(fields) => fields }
+    }
+}
+
 impl Property {
+    pub fn with_value(mut self, value: Value) -> Self {
+        self.value = value;
+        self
+    }
     pub fn new(value: Value) -> Self {
-        Property {
+        Property::Data(PropertyFields {
             value,
             writable: true,
             enumerable: true,
             configurable: true,
             get: None,
             set: None,
-        }
+        })
     }
 
     /// Create an accessor property with the given getter/setter.
     pub fn accessor(get: Option<Value>, set: Option<Value>) -> Self {
-        Property {
+        Property::Accessor(PropertyFields {
             value: Value::Undefined,
             writable: false,
             enumerable: true,
             configurable: true,
             get,
             set,
-        }
+        })
     }
 
     /// A built-in method value property: writable + configurable, non-enumerable.
     pub fn method(value: Value) -> Self {
-        Property {
+        Property::Data(PropertyFields {
             value,
             writable: true,
             enumerable: false,
             configurable: true,
             get: None,
             set: None,
-        }
+        })
     }
 
     /// A built-in config value property: non-writable, non-enumerable, configurable.
     pub fn config(value: Value) -> Self {
-        Property {
+        Property::Data(PropertyFields {
             value,
             writable: false,
             enumerable: false,
             configurable: true,
             get: None,
             set: None,
-        }
+        })
     }
 
     /// A data property with explicit attributes (for `Object.defineProperty`).
     pub fn data(value: Value, writable: bool, enumerable: bool, configurable: bool) -> Self {
-        Property {
+        Property::Data(PropertyFields {
             value,
             writable,
             enumerable,
             configurable,
             get: None,
             set: None,
-        }
+        })
     }
 
     /// A non-writable, non-enumerable, non-configurable constant.
     pub fn constant(value: Value) -> Self {
-        Property {
+        Property::Data(PropertyFields {
             value,
             writable: false,
             enumerable: false,
             configurable: false,
             get: None,
             set: None,
-        }
+        })
     }
 
     /// Whether this property is an accessor (getter/setter) descriptor.
     pub fn is_accessor(&self) -> bool {
-        self.get.is_some() || self.set.is_some()
+        matches!(self, Property::Accessor(_))
     }
 }
 
@@ -680,7 +852,8 @@ impl Default for Object {
 pub struct Function {
     pub name: Rc<str>,
     pub params: Vec<crate::ast::Pattern>,
-    pub body: Vec<Stmt>,
+    /// Immutable function body shared by every invocation of the function.
+    pub body: Rc<Vec<Stmt>>,
     /// The lexical environment captured by this function. Held *strongly* so that
     /// closures can capture locals; the engine's mark-and-sweep GC reclaims any
     /// cycle that this creates when the function becomes unreachable.
@@ -714,19 +887,90 @@ pub struct Function {
 #[derive(Debug, Clone)]
 pub struct ArrayData {
     pub elems: Vec<Value>,
+    /// Logical array length. For sparse arrays this may be much larger than
+    /// `elems.len()`.
+    pub length: usize,
+    /// Values stored outside the dense prefix, keyed by array index.
+    pub sparse: BTreeMap<usize, Value>,
     pub proto: Option<Rc<RefCell<Object>>>,
     /// Named (non-index) own properties, e.g. `index`/`input`/`groups` on a
     /// `RegExp` `exec` result.
     pub props: BTreeMap<Rc<str>, Property>,
 }
 
+/// Lazy iterator over an array's indexed values.
+///
+/// Unlike `iterable_values`, this iterator does not allocate a `Vec` for the
+/// logical length of a sparse array. Holes are yielded as `undefined`, just as
+/// the JavaScript array iterator does.
+#[derive(Debug, Clone)]
+pub struct ArrayValueIter {
+    array: Rc<RefCell<ArrayData>>,
+    index: usize,
+    end: usize,
+}
+
+impl ArrayValueIter {
+    pub fn new(array: Rc<RefCell<ArrayData>>) -> Self {
+        let end = array.borrow().logical_len();
+        Self { array, index: 0, end }
+    }
+}
+
+impl Iterator for ArrayValueIter {
+    type Item = Value;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index >= self.end {
+            return None;
+        }
+        let i = self.index;
+        self.index += 1;
+        Some(self.array.borrow().get_index(i).unwrap_or(Value::Undefined))
+    }
+}
+
 impl ArrayData {
+    const DENSE_LIMIT: usize = 1 << 20;
     pub fn new(elems: Vec<Value>, proto: Option<Rc<RefCell<Object>>>) -> Self {
         ArrayData {
+            length: elems.len(),
             elems,
+            sparse: BTreeMap::new(),
             proto,
             props: BTreeMap::new(),
         }
+    }
+
+    pub fn logical_len(&self) -> usize {
+        if self.sparse.is_empty() && self.length <= Self::DENSE_LIMIT {
+            self.elems.len()
+        } else {
+            self.length.max(self.elems.len())
+        }
+    }
+
+    pub fn get_index(&self, index: usize) -> Option<Value> {
+        if index < self.elems.len() { self.elems.get(index).cloned() }
+        else { self.sparse.get(&index).cloned() }
+    }
+
+    pub fn set_index(&mut self, index: usize, value: Value) {
+        const SPARSE_GAP: usize = 1024;
+        self.length = self.length.max(index.saturating_add(1));
+        if index > self.elems.len().saturating_add(SPARSE_GAP) {
+            self.sparse.insert(index, value);
+        } else {
+            while self.elems.len() <= index { self.elems.push(Value::Undefined); }
+            self.elems[index] = value;
+        }
+    }
+
+    pub fn set_length(&mut self, length: usize) {
+        self.length = length;
+        if length <= Self::DENSE_LIMIT { self.elems.resize(length, Value::Undefined); }
+        else if length < self.elems.len() { self.elems.truncate(length); }
+        self.sparse.retain(|i, _| *i < length);
     }
 }
 

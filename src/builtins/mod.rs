@@ -204,25 +204,11 @@ pub fn register_builtins(engine: &mut Engine) {
     proto_method(&error_proto, "toString", err_to_string);
     error_proto.borrow_mut().props.insert(
         Rc::from("name"),
-        Property {
-            value: Value::String(Rc::from("Error")),
-            writable: true,
-            enumerable: false,
-            configurable: true,
-            get: None,
-            set: None,
-        },
+        Property::data(Value::String(Rc::from("Error")), true, false, true),
     );
     error_proto.borrow_mut().props.insert(
         Rc::from("message"),
-        Property {
-            value: Value::String(Rc::from("")),
-            writable: true,
-            enumerable: false,
-            configurable: true,
-            get: None,
-            set: None,
-        },
+        Property::data(Value::String(Rc::from("")), true, false, true),
     );
 
     // --- Global constructors ---
@@ -441,4 +427,3 @@ pub fn register_builtins(engine: &mut Engine) {
     promise::register_promise(engine);
     timers::register_timers(engine);
 }
-

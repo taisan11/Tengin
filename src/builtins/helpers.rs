@@ -252,25 +252,11 @@ pub(super) fn reg_error_sub(
         let mut b = proto.borrow_mut();
         b.props.insert(
             Rc::from("name"),
-            Property {
-                value: Value::String(Rc::from(name)),
-                writable: true,
-                enumerable: false,
-                configurable: true,
-                get: None,
-                set: None,
-            },
+            Property::data(Value::String(Rc::from(name)), true, false, true),
         );
         b.props.insert(
             Rc::from("message"),
-            Property {
-                value: Value::String(Rc::from("")),
-                writable: true,
-                enumerable: false,
-                configurable: true,
-                get: None,
-                set: None,
-            },
+            Property::data(Value::String(Rc::from("")), true, false, true),
         );
     }
     let ctor = reg_error(engine, name, f, proto.clone());

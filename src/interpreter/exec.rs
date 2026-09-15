@@ -143,7 +143,7 @@ impl Engine {
         let f = Rc::new(RefCell::new(Function {
             name: name.clone(),
             params,
-            body,
+            body: Rc::new(body),
             closure,
             props: crate::value::new_props(),
             proto: None,
@@ -1253,6 +1253,12 @@ impl Engine {
                 let label2 = label.map(|l| l.clone());
                 let next: StmtsNext = Rc::new(move |engine, frag| {
                     let obj = frag.unwrap_or(Value::Undefined);
+                    if let Value::Array(array) = obj {
+                        return engine.exec_for_of_array(
+                            label2.as_ref(), kind2, &name2, &body2, &env2, &array, 0,
+                            Some(Value::Undefined),
+                        );
+                    }
                     let items = engine.iterable_values(&obj)?;
                     engine.exec_for_of_items(
                         label2.as_ref(),
@@ -1272,8 +1278,82 @@ impl Engine {
             }
             Err(e) => return Err(e),
         };
+        if let Value::Array(array) = obj {
+            return self.exec_for_of_array(label, kind, name, body, env, &array, 0, Some(Value::Undefined));
+        }
         let items = self.iterable_values(&obj)?;
         self.exec_for_of_items(label, kind, name, body, env, &items, 0, Some(Value::Undefined))
+    }
+
+    /// Stream an array's values directly from its backing storage. In
+    /// particular, this keeps sparse arrays lazy and avoids allocating one
+    /// `Value::Undefined` per hole before the first loop iteration.
+    #[allow(clippy::too_many_arguments)]
+    fn exec_for_of_array(
+        &self,
+        label: Option<&Rc<str>>,
+        kind: VarKind,
+        name: &Pattern,
+        body: &[Stmt],
+        env: &Rc<RefCell<Env>>,
+        array: &Rc<RefCell<crate::value::ArrayData>>,
+        idx: usize,
+        v: Option<Value>,
+    ) -> Result<Option<Value>> {
+        let mut value = v;
+        let is_var = matches!(kind, VarKind::Var);
+        let var_scope = Env::function_scope(env);
+        let mut k = idx;
+        loop {
+            // Array iterators observe length changes between `next()` calls.
+            // Re-read it here while still avoiding any materialized value list.
+            if k >= array.borrow().logical_len() {
+                break;
+            }
+            let val = array.borrow().get_index(k).unwrap_or(Value::Undefined);
+            let per_iter = if is_var {
+                self.bind_pattern(name, &val, &var_scope).map_err(|e| match e {
+                    Error::Suspend { .. } => Error::Unimplemented("await in for-head pattern is not implemented".to_string()),
+                    other => other,
+                })?;
+                None
+            } else {
+                let pe = Rc::new(RefCell::new(Env::new_block(env.clone())));
+                self.register_env(&pe);
+                self.bind_pattern(name, &val, &pe).map_err(|e| match e {
+                    Error::Suspend { .. } => Error::Unimplemented("await in for-head pattern is not implemented".to_string()),
+                    other => other,
+                })?;
+                if matches!(kind, VarKind::Const) { mark_const_idents(name, &pe); }
+                Some(pe)
+            };
+            let body_env = per_iter.as_ref().unwrap_or(env);
+            match self.exec_stmts(body, body_env) {
+                Err(Error::Suspend { awaited, cont }) => {
+                    let label2 = label.cloned();
+                    let name2 = name.clone();
+                    let body2 = body.to_vec();
+                    let env2 = env.clone();
+                    let array2 = array.clone();
+                    let value2 = value.clone();
+                    let next: OutcomeNext = Rc::new(move |engine, outcome| {
+                        match engine.loop_body_step(outcome, value2.clone(), label2.as_ref()) {
+                            LoopStep::Next(v2) => engine.exec_for_of_array(
+                                label2.as_ref(), kind, &name2, &body2, &env2, &array2, k + 1, v2,
+                            ),
+                            LoopStep::Done(r) => r,
+                        }
+                    });
+                    return Err(Error::Suspend { awaited, cont: chain_outcome(cont, next) });
+                }
+                other => match self.loop_body_step(other, value, label) {
+                    LoopStep::Next(v2) => value = v2,
+                    LoopStep::Done(r) => return r,
+                },
+            }
+            k += 1;
+        }
+        Ok(value)
     }
 
     /// `for-of` iterations from index `idx`, accumulating completion `v`.
@@ -1915,6 +1995,204 @@ impl Engine {
 
     // --- expression evaluation ---
 
+    /// Syntactic suspension check used to select the allocation-free CPS fast
+    /// path. Function bodies are intentionally not inspected: creating a
+    /// function never executes its body.
+    fn expr_may_suspend(expr: &Expr) -> bool {
+        match expr {
+            Expr::Await(_) | Expr::Yield { .. } => true,
+            Expr::Member { obj, computed, .. } => {
+                Self::expr_may_suspend(obj)
+                    || computed.as_deref().is_some_and(Self::expr_may_suspend)
+            }
+            Expr::Call { callee, args, .. } | Expr::New { callee, args } => {
+                Self::expr_may_suspend(callee)
+                    || args.iter().any(|a| match a {
+                        Arg::Expr(e) | Arg::Spread(e) => Self::expr_may_suspend(e),
+                    })
+            }
+            Expr::Sequence(es) => es.iter().any(Self::expr_may_suspend),
+            Expr::InstanceOf { left, right }
+            | Expr::Binary { left, right, .. }
+            | Expr::Logical { left, right, .. } => {
+                Self::expr_may_suspend(left) || Self::expr_may_suspend(right)
+            }
+            Expr::Unary { operand, .. } | Expr::ToString(operand) => Self::expr_may_suspend(operand),
+            Expr::Ternary { cond, then, else_ } => {
+                Self::expr_may_suspend(cond)
+                    || Self::expr_may_suspend(then)
+                    || Self::expr_may_suspend(else_)
+            }
+            Expr::Assignment { target, value } => {
+                let target_suspends = match target {
+                    AssignTarget::Expr(e) => Self::expr_may_suspend(e),
+                    AssignTarget::Pattern(_) => false,
+                };
+                target_suspends || Self::expr_may_suspend(value)
+            }
+            Expr::Array(es) => es.iter().any(|e| match e {
+                ArrayElem::Expr(x) | ArrayElem::Spread(x) => Self::expr_may_suspend(x),
+                ArrayElem::Elision => false,
+            }),
+            Expr::Object(ps) => ps.iter().any(|p| match p {
+                Prop::Init { key, value } => {
+                    matches!(key, PropKey::Computed(e) if Self::expr_may_suspend(e))
+                        || Self::expr_may_suspend(value)
+                }
+                Prop::Method { key, .. } | Prop::Accessor { key, .. } => {
+                    matches!(key, PropKey::Computed(e) if Self::expr_may_suspend(e))
+                }
+                Prop::Spread(e) => Self::expr_may_suspend(e),
+            }),
+            Expr::Tagged { tag, cooked, subs, .. } => {
+                Self::expr_may_suspend(tag)
+                    || cooked.iter().any(Self::expr_may_suspend)
+                    || subs.iter().any(Self::expr_may_suspend)
+            }
+            Expr::Function { .. } | Expr::Arrow { .. } | Expr::Class(_) => false,
+            Expr::Lit(_) | Expr::Ident(_) | Expr::This | Expr::Super => false,
+        }
+    }
+
+    fn eval_args_sync(&self, args: &[Arg], env: &Rc<RefCell<Env>>) -> Result<Vec<Value>> {
+        let mut argv = Vec::with_capacity(args.len());
+        for arg in args {
+            match arg {
+                Arg::Expr(e) => argv.push(self.eval_expr_sync(e, env)?),
+                Arg::Spread(e) => {
+                    let value = self.eval_expr_sync(e, env)?;
+                    if let Value::Array(a) = &value {
+                        argv.extend(self.array_values_iter(a.clone()));
+                    } else {
+                        argv.extend(self.iterable_values(&value)?);
+                    }
+                }
+            }
+        }
+        Ok(argv)
+    }
+
+    fn eval_call_sync(
+        &self,
+        callee: &Expr,
+        args: &[Arg],
+        env: &Rc<RefCell<Env>>,
+        optional: bool,
+    ) -> Result<Value> {
+        if matches!(callee, Expr::Super) {
+            let ctor = env.borrow().get("__super_ctor__").ok_or_else(|| {
+                Error::Runtime(Value::String(Rc::from(
+                    "SyntaxError: 'super' constructor call outside subclass",
+                )))
+            })?;
+            let argv = self.eval_args_sync(args, env)?;
+            let active_target = self.active_new_target.borrow().clone();
+            if let Some(nt) = active_target {
+                let v = self.construct_with_new_target(&ctor, &argv, &nt)?;
+                env.borrow_mut().vars.insert(Rc::from("__this__"), v.clone());
+                return Ok(v);
+            }
+            let this = env
+                .borrow()
+                .get("__this__")
+                .unwrap_or_else(|| Value::Object(self.global_object.clone()));
+            return self.call_function(&ctor, &this, &argv);
+        }
+        let (func, this) = match callee {
+            Expr::Member { obj, prop, computed, optional: member_optional } => {
+                let base = self.eval_expr_sync(obj, env)?;
+                if (optional || *member_optional) && is_nullish(&base) {
+                    return Ok(Value::Undefined);
+                }
+                let key = match computed {
+                    Some(e) => self.to_property_key(&self.eval_expr_sync(e, env)?)?,
+                    None => prop.clone(),
+                };
+                let f = self.get_member(&base, &key)?;
+                (f, base)
+            }
+            _ => {
+                let f = self.eval_expr_sync(callee, env)?;
+                if optional && is_nullish(&f) {
+                    return Ok(Value::Undefined);
+                }
+                (f, Value::Object(self.global_object.clone()))
+            }
+        };
+        let argv = self.eval_args_sync(args, env)?;
+        self.call_function(&func, &this, &argv)
+    }
+
+    /// Evaluate non-suspending expressions directly, without allocating CPS
+    /// closures. The fallback is retained for expression forms whose normal
+    /// evaluator already has no suspension points (function/class literals).
+    fn eval_expr_sync(&self, expr: &Expr, env: &Rc<RefCell<Env>>) -> Result<Value> {
+        match expr {
+            Expr::Lit(l) => Ok(lit_to_value(l)),
+            Expr::Ident(name) => env
+                .borrow()
+                .get(name)
+                .or_else(|| self.global_object.borrow().props.get(name).map(|p| p.value.clone()))
+                .ok_or_else(|| Error::Runtime(Value::String(Rc::from(format!("ReferenceError: {name} is not defined"))))),
+            Expr::This => Ok(env.borrow().get("__this__").unwrap_or_else(|| Value::Object(self.global_object.clone()))),
+            Expr::Member { obj, prop, computed, optional } => {
+                let base = self.eval_expr_sync(obj, env)?;
+                if *optional && is_nullish(&base) { return Ok(Value::Undefined); }
+                let key = match computed {
+                    Some(e) => self.to_property_key(&self.eval_expr_sync(e, env)?)?,
+                    None => prop.clone(),
+                };
+                self.get_member(&base, &key)
+            }
+            Expr::Call { callee, args, optional } => self.eval_call_sync(callee, args, env, *optional),
+            Expr::New { callee, args } => {
+                let f = self.eval_expr_sync(callee, env)?;
+                let argv = self.eval_args_sync(args, env)?;
+                self.construct(&f, &argv)
+            }
+            Expr::Sequence(es) => {
+                let mut value = Value::Undefined;
+                for e in es { value = self.eval_expr_sync(e, env)?; }
+                Ok(value)
+            }
+            Expr::InstanceOf { left, right } => {
+                let l = self.eval_expr_sync(left, env)?;
+                let r = self.eval_expr_sync(right, env)?;
+                self.eval_instance_of(&l, &r)
+            }
+            Expr::Binary { op, left, right } => {
+                let l = self.eval_expr_sync(left, env)?;
+                let r = self.eval_expr_sync(right, env)?;
+                self.eval_binary_value(*op, &l, &r)
+            }
+            Expr::Logical { op, left, right } => {
+                let l = self.eval_expr_sync(left, env)?;
+                let take_right = match op {
+                    LogicalOp::And => l.to_boolean(),
+                    LogicalOp::Or => !l.to_boolean(),
+                    LogicalOp::Coalesce => is_nullish(&l),
+                };
+                if take_right { self.eval_expr_sync(right, env) } else { Ok(l) }
+            }
+            Expr::Unary { op, operand } => {
+                let v = self.eval_expr_sync(operand, env)?;
+                self.eval_unary_value(*op, &v, operand, env)
+            }
+            Expr::Ternary { cond, then, else_ } => {
+                if self.eval_expr_sync(cond, env)?.to_boolean() { self.eval_expr_sync(then, env) } else { self.eval_expr_sync(else_, env) }
+            }
+            Expr::Assignment { target, value } => {
+                let v = self.eval_expr_sync(value, env)?;
+                self.assign_to_target(target, v, env)
+            }
+            Expr::ToString(e) => {
+                let v = self.eval_expr_sync(e, env)?;
+                Ok(Value::String(self.to_string_fallible(&v)?))
+            }
+            _ => self.eval_expr(expr, env),
+        }
+    }
+
     fn eval_expr(&self, expr: &Expr, env: &Rc<RefCell<Env>>) -> Result<Value> {
         match expr {
             Expr::Lit(l) => Ok(lit_to_value(l)),
@@ -1957,6 +2235,9 @@ impl Engine {
                 }))
             }
             Expr::Call { callee, args, optional } => {
+                if !Self::expr_may_suspend(expr) {
+                    return self.eval_call_sync(callee, args, env, *optional);
+                }
                 let callee_c = callee.clone();
                 let args_c = args.clone();
                 let optional_c = *optional;
@@ -2027,6 +2308,11 @@ impl Engine {
                 ))
             }
             Expr::New { callee, args } => {
+                if !Self::expr_may_suspend(expr) {
+                    let func = self.eval_expr_sync(callee, env)?;
+                    let argv = self.eval_args_sync(args, env)?;
+                    return self.construct(&func, &argv);
+                }
                 let args2 = args.clone();
                 let env2 = env.clone();
                 self.eval_expr_chain(callee, env, Rc::new(move |engine, func| {
@@ -2919,7 +3205,7 @@ impl Engine {
         let ctor = Rc::new(RefCell::new(Function {
             name: name.clone().unwrap_or_else(|| Rc::from("")),
             params: ctor_params,
-            body: full_ctor_body,
+            body: Rc::new(full_ctor_body),
             closure: env.clone(),
             props: crate::value::new_props(),
             proto: Some(self.function_prototype.clone()),
@@ -3235,8 +3521,14 @@ impl Engine {
                     }
                     Some(_) => Ok(false),
                     None => {
-                        // Numeric-index deletion creates a hole; the engine uses a
-                        // dense vector, so report success without a value change.
+                        // Numeric-index deletion creates a hole. Sparse entries
+                        // can be removed without touching the dense prefix.
+                        if let Ok(i) = key.parse::<usize>() {
+                            b.sparse.remove(&i);
+                            if i < b.elems.len() {
+                                b.elems[i] = Value::Undefined;
+                            }
+                        }
                         Ok(true)
                     }
                 }
@@ -3737,7 +4029,7 @@ impl Engine {
             args_obj
                 .borrow_mut()
                 .props
-                .insert(Rc::from(i.to_string()), Property::new(av.clone()));
+                .insert(self.intern_key(&i.to_string()), Property::new(av.clone()));
         }
         args_obj.borrow_mut().props.insert(
             Rc::from("length"),
@@ -3866,7 +4158,7 @@ impl Engine {
             args_obj
                 .borrow_mut()
                 .props
-                .insert(Rc::from(i.to_string()), Property::new(av.clone()));
+                .insert(self.intern_key(&i.to_string()), Property::new(av.clone()));
         }
         args_obj.borrow_mut().props.insert(
             Rc::from("length"),

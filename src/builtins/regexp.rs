@@ -631,14 +631,7 @@ pub(crate) fn register_regexp(engine: &mut Engine) {
         }
         proto.borrow_mut().props.insert(
             Rc::from(*name),
-            Property {
-                value: Value::Undefined,
-                writable: false,
-                enumerable: false,
-                configurable: true,
-                get: Some(getter),
-                set: None,
-            },
+            Property::accessor(Some(getter), None),
         );
     }
 

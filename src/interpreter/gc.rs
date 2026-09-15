@@ -6,7 +6,7 @@
 use alloc::rc::{Rc, Weak};
 use alloc::vec::Vec;
 use core::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::environment::Env;
 use crate::value::{
@@ -43,9 +43,61 @@ pub(crate) struct GcHeap {
     #[allow(dead_code)]
     pub weaksets: Vec<Weak<RefCell<WeakSetData>>>,
     pub promises: Vec<Weak<RefCell<PromiseData>>>,
+    /// Generation for every registered cell (`0` = nursery, `1` = tenured).
+    /// The weak registries remain type-specific because the collector needs
+    /// to clear each cell's outgoing edges when it is reclaimed.
+    generations: HashMap<*const (), u8>,
+    /// Number of cells currently in the nursery. Keeping this counter avoids
+    /// scanning all generation metadata at every allocation safe point.
+    pub(crate) nursery_len: usize,
+    /// Number of minor collections since the last major collection.
+    pub(crate) minor_collections: usize,
 }
 
+/// A minor collection is deliberately much cheaper to trigger than a full
+/// heap collection. Most temporary interpreter values die before reaching
+/// this limit, while long-lived objects are promoted after surviving once.
+pub(crate) const NURSERY_THRESHOLD: usize = 256;
+/// Maximum amount of allocation pressure allowed between major collections.
 pub(crate) const GC_THRESHOLD: usize = 4096;
+/// Run a major collection periodically even when allocation pressure is made
+/// up mostly of promoted objects.
+pub(crate) const MAJOR_AFTER_MINOR: usize = 8;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CollectionKind {
+    Minor,
+    Major,
+}
+
+impl GcHeap {
+    pub(crate) fn register(&mut self, ptr: *const ()) {
+        // A pointer can be re-used after a previous cell was reclaimed. Make
+        // sure it starts life in the nursery again rather than inheriting the
+        // old object's generation.
+        if !self.generations.contains_key(&ptr) {
+            self.generations.insert(ptr, 0);
+            self.nursery_len += 1;
+        }
+    }
+
+    fn is_young(&self, ptr: *const ()) -> bool {
+        self.generations.get(&ptr).copied() == Some(0)
+    }
+
+    fn promote(&mut self, ptr: *const ()) {
+        if self.is_young(ptr) {
+            self.generations.insert(ptr, 1);
+            self.nursery_len = self.nursery_len.saturating_sub(1);
+        }
+    }
+
+    fn forget(&mut self, ptr: *const ()) {
+        if self.generations.remove(&ptr) == Some(0) {
+            self.nursery_len = self.nursery_len.saturating_sub(1);
+        }
+    }
+}
 
 impl Engine {
     /// Allocate a fresh plain object linked to `Object.prototype`.
@@ -56,7 +108,9 @@ impl Engine {
     /// Allocate an object with a custom prototype, registering it for GC.
     pub(crate) fn make_object(&self, proto: Rc<RefCell<Object>>) -> Rc<RefCell<Object>> {
         let o = Rc::new(RefCell::new(Object::with_proto(proto)));
-        self.gc.borrow_mut().objects.push(Rc::downgrade(&o));
+        let mut gc = self.gc.borrow_mut();
+        gc.objects.push(Rc::downgrade(&o));
+        gc.register(Rc::as_ptr(&o) as *const ());
         self.gc_pressure.set(self.gc_pressure.get() + 1);
         o
     }
@@ -64,45 +118,70 @@ impl Engine {
     /// Allocate an array value registered for GC.
     pub(crate) fn new_array(&self, elems: Vec<Value>) -> Rc<RefCell<ArrayData>> {
         let a = Rc::new(RefCell::new(ArrayData::new(elems, Some(self.array_prototype.clone()))));
-        self.gc.borrow_mut().arrays.push(Rc::downgrade(&a));
+        let mut gc = self.gc.borrow_mut();
+        gc.arrays.push(Rc::downgrade(&a));
+        gc.register(Rc::as_ptr(&a) as *const ());
         self.gc_pressure.set(self.gc_pressure.get() + 1);
         a
     }
 
     pub(crate) fn register_function(&self, f: &Rc<RefCell<Function>>) {
-        self.gc.borrow_mut().functions.push(Rc::downgrade(f));
+        let mut gc = self.gc.borrow_mut();
+        gc.functions.push(Rc::downgrade(f));
+        gc.register(Rc::as_ptr(f) as *const ());
         self.gc_pressure.set(self.gc_pressure.get() + 1);
     }
 
     /// Register a lexical environment for GC. Environments are kept alive
     /// strongly by closures, so they must be swept round with the value cells.
     pub(crate) fn register_env(&self, env: &Rc<RefCell<Env>>) {
-        self.gc.borrow_mut().envs.push(Rc::downgrade(env));
+        let mut gc = self.gc.borrow_mut();
+        gc.envs.push(Rc::downgrade(env));
+        gc.register(Rc::as_ptr(env) as *const ());
         self.gc_pressure.set(self.gc_pressure.get() + 1);
     }
 
     /// Register a `Map` cell for GC.
     pub(crate) fn register_map(&self, m: &Rc<RefCell<MapData>>) {
-        self.gc.borrow_mut().maps.push(Rc::downgrade(m));
+        let mut gc = self.gc.borrow_mut();
+        gc.maps.push(Rc::downgrade(m));
+        gc.register(Rc::as_ptr(m) as *const ());
         self.gc_pressure.set(self.gc_pressure.get() + 1);
     }
 
     /// Register a `Set` cell for GC.
     pub(crate) fn register_set(&self, s: &Rc<RefCell<SetData>>) {
-        self.gc.borrow_mut().sets.push(Rc::downgrade(s));
+        let mut gc = self.gc.borrow_mut();
+        gc.sets.push(Rc::downgrade(s));
+        gc.register(Rc::as_ptr(s) as *const ());
         self.gc_pressure.set(self.gc_pressure.get() + 1);
     }
 
     /// Register a `WeakMap` cell for GC.
     pub(crate) fn register_weakmap(&self, w: &Rc<RefCell<WeakMapData>>) {
-        self.gc.borrow_mut().weakmaps.push(Rc::downgrade(w));
+        let mut gc = self.gc.borrow_mut();
+        gc.weakmaps.push(Rc::downgrade(w));
+        gc.register(Rc::as_ptr(w) as *const ());
         self.gc_pressure.set(self.gc_pressure.get() + 1);
     }
 
     /// Register a `WeakSet` cell for GC.
     pub(crate) fn register_weakset(&self, w: &Rc<RefCell<WeakSetData>>) {
-        self.gc.borrow_mut().weaksets.push(Rc::downgrade(w));
+        let mut gc = self.gc.borrow_mut();
+        gc.weaksets.push(Rc::downgrade(w));
+        gc.register(Rc::as_ptr(w) as *const ());
         self.gc_pressure.set(self.gc_pressure.get() + 1);
+    }
+
+    /// Register a native function allocated by a built-in installer.
+    pub(crate) fn register_native(&self, f: &Rc<RefCell<NativeFunctionData>>) {
+        let mut gc = self.gc.borrow_mut();
+        let ptr = Rc::as_ptr(f) as *const ();
+        if !gc.generations.contains_key(&ptr) {
+            gc.natives.push(Rc::downgrade(f));
+            gc.register(ptr);
+            self.gc_pressure.set(self.gc_pressure.get() + 1);
+        }
     }
 
     /// Run the garbage collector.
@@ -119,7 +198,23 @@ impl Engine {
         self.collect_with(None);
     }
 
+    /// Collect only the nursery. Cells that survive are promoted to the
+    /// tenured generation; tenured cells are left untouched until a major
+    /// collection. This is useful to embedders that want an explicit cheap
+    /// safe point between evaluations.
+    pub fn collect_minor(&self) {
+        self.collect_minor_with(None);
+    }
+
     pub(crate) fn collect_with(&self, extra: Option<&Value>) {
+        self.collect_kind(extra, CollectionKind::Major);
+    }
+
+    pub(crate) fn collect_minor_with(&self, extra: Option<&Value>) {
+        self.collect_kind(extra, CollectionKind::Minor);
+    }
+
+    fn collect_kind(&self, extra: Option<&Value>, kind: CollectionKind) {
         let mut marked = HashSet::new();
         let mut values: Vec<Value> = Vec::new();
         let mut envs: Vec<Rc<RefCell<Env>>> = Vec::new();
@@ -184,26 +279,66 @@ impl Engine {
             }
         }
 
-        while let Some(v) = values.pop() {
-            mark_value(&v, &mut marked, &mut values, &mut envs);
-        }
-        while let Some(e) = envs.pop() {
-            mark_env(&e, &mut marked, &mut values, &mut envs);
+        // Environments can introduce more values and values can introduce
+        // more environments (closures), so drain both work lists to a fixed
+        // point instead of stopping after the first list becomes empty.
+        loop {
+            while let Some(v) = values.pop() {
+                mark_value(&v, &mut marked, &mut values, &mut envs);
+            }
+            if let Some(e) = envs.pop() {
+                mark_env(&e, &mut marked, &mut values, &mut envs);
+            } else {
+                break;
+            }
         }
 
-        self.sweep(&marked);
+        self.sweep(&marked, kind);
     }
 
-    fn sweep(&self, marked: &HashSet<*const ()>) {
-        self.gc_pressure.set(0);
+    fn sweep(&self, marked: &HashSet<*const ()>, kind: CollectionKind) {
+        if kind == CollectionKind::Major {
+            self.gc_pressure.set(0);
+        }
         let mut gc = self.gc.borrow_mut();
-        let mark = |o: &Rc<RefCell<Object>>| marked.contains(&(Rc::as_ptr(o) as *const ()));
+        if kind == CollectionKind::Minor {
+            gc.minor_collections += 1;
+        } else {
+            gc.minor_collections = 0;
+        }
+        // Minor GC only reclaims nursery cells. A live nursery cell is
+        // tenured immediately; an unmarked tenured cell waits for major GC.
+        let retain = |gc: &mut GcHeap, ptr: *const (), live: bool| -> bool {
+            if kind == CollectionKind::Minor {
+                if gc.is_young(ptr) {
+                    if live {
+                        gc.promote(ptr);
+                        true
+                    } else {
+                        gc.forget(ptr);
+                        false
+                    }
+                } else {
+                    true
+                }
+            } else if live {
+                // A full collection is also a promotion point: an object
+                // that survived a major cycle has already demonstrated that
+                // it is long-lived.
+                gc.promote(ptr);
+                true
+            } else {
+                gc.forget(ptr);
+                false
+            }
+        };
 
         let objects = core::mem::take(&mut gc.objects);
         let mut keep = Vec::with_capacity(objects.len());
         for w in objects {
+            let ptr = w.as_ptr() as *const ();
             if let Some(o) = w.upgrade() {
-                if mark(&o) {
+                if retain(&mut gc, ptr, marked.contains(&ptr)) {
                     keep.push(Rc::downgrade(&o));
                 } else {
                     let mut b = o.borrow_mut();
@@ -211,6 +346,8 @@ impl Engine {
                     b.proto = None;
                     b.ctor = None;
                 }
+            } else {
+                gc.forget(ptr);
             }
         }
         gc.objects = keep;
@@ -218,13 +355,19 @@ impl Engine {
         let arrays = core::mem::take(&mut gc.arrays);
         let mut keep = Vec::with_capacity(arrays.len());
         for w in arrays {
+            let ptr = w.as_ptr() as *const ();
             if let Some(a) = w.upgrade() {
-                if marked.contains(&(Rc::as_ptr(&a) as *const ())) {
+                if retain(&mut gc, ptr, marked.contains(&ptr)) {
                     keep.push(Rc::downgrade(&a));
                 } else {
-                    a.borrow_mut().elems.clear();
-                    a.borrow_mut().proto = None;
+                    let mut b = a.borrow_mut();
+                    b.elems.clear();
+                    b.sparse.clear();
+                    b.length = 0;
+                    b.proto = None;
                 }
+            } else {
+                gc.forget(ptr);
             }
         }
         gc.arrays = keep;
@@ -232,8 +375,9 @@ impl Engine {
         let functions = core::mem::take(&mut gc.functions);
         let mut keep = Vec::with_capacity(functions.len());
         for w in functions {
+            let ptr = w.as_ptr() as *const ();
             if let Some(f) = w.upgrade() {
-                if marked.contains(&(Rc::as_ptr(&f) as *const ())) {
+                if retain(&mut gc, ptr, marked.contains(&ptr)) {
                     keep.push(Rc::downgrade(&f));
                 } else {
                     let mut b = f.borrow_mut();
@@ -243,19 +387,46 @@ impl Engine {
                     b.super_ctor = None;
                     b.this_capture = None;
                 }
+            } else {
+                gc.forget(ptr);
             }
         }
         gc.functions = keep;
 
+        let natives = core::mem::take(&mut gc.natives);
+        let mut keep = Vec::with_capacity(natives.len());
+        for w in natives {
+            let ptr = w.as_ptr() as *const ();
+            if let Some(nf) = w.upgrade() {
+                if retain(&mut gc, ptr, marked.contains(&ptr)) {
+                    keep.push(Rc::downgrade(&nf));
+                } else {
+                    let mut b = nf.borrow_mut();
+                    b.props.clear();
+                    b.proto = None;
+                    b.realm = None;
+                    b.fn_value_proto = None;
+                }
+            } else {
+                gc.forget(ptr);
+            }
+        }
+        gc.natives = keep;
+
         let maps = core::mem::take(&mut gc.maps);
         let mut keep = Vec::with_capacity(maps.len());
         for w in maps {
+            let ptr = w.as_ptr() as *const ();
             if let Some(m) = w.upgrade() {
-                if marked.contains(&(Rc::as_ptr(&m) as *const ())) {
+                if retain(&mut gc, ptr, marked.contains(&ptr)) {
                     keep.push(Rc::downgrade(&m));
                 } else {
-                    m.borrow_mut().entries.clear();
+                    let mut b = m.borrow_mut();
+                    b.entries.clear();
+                    b.index.clear();
                 }
+            } else {
+                gc.forget(ptr);
             }
         }
         gc.maps = keep;
@@ -263,12 +434,17 @@ impl Engine {
         let sets = core::mem::take(&mut gc.sets);
         let mut keep = Vec::with_capacity(sets.len());
         for w in sets {
+            let ptr = w.as_ptr() as *const ();
             if let Some(s) = w.upgrade() {
-                if marked.contains(&(Rc::as_ptr(&s) as *const ())) {
+                if retain(&mut gc, ptr, marked.contains(&ptr)) {
                     keep.push(Rc::downgrade(&s));
                 } else {
-                    s.borrow_mut().entries.clear();
+                    let mut b = s.borrow_mut();
+                    b.entries.clear();
+                    b.index.clear();
                 }
+            } else {
+                gc.forget(ptr);
             }
         }
         gc.sets = keep;
@@ -276,12 +452,16 @@ impl Engine {
         let weakmaps = core::mem::take(&mut gc.weakmaps);
         let mut keep = Vec::with_capacity(weakmaps.len());
         for w in weakmaps {
+            let ptr = w.as_ptr() as *const ();
             if let Some(wm) = w.upgrade() {
-                if marked.contains(&(Rc::as_ptr(&wm) as *const ())) {
+                if retain(&mut gc, ptr, marked.contains(&ptr)) {
+                    wm.borrow_mut().entries.retain(|(k, _)| k.is_alive());
                     keep.push(Rc::downgrade(&wm));
                 } else {
                     wm.borrow_mut().entries.clear();
                 }
+            } else {
+                gc.forget(ptr);
             }
         }
         gc.weakmaps = keep;
@@ -289,12 +469,16 @@ impl Engine {
         let weaksets = core::mem::take(&mut gc.weaksets);
         let mut keep = Vec::with_capacity(weaksets.len());
         for w in weaksets {
+            let ptr = w.as_ptr() as *const ();
             if let Some(ws) = w.upgrade() {
-                if marked.contains(&(Rc::as_ptr(&ws) as *const ())) {
+                if retain(&mut gc, ptr, marked.contains(&ptr)) {
+                    ws.borrow_mut().entries.retain(|k| k.is_alive());
                     keep.push(Rc::downgrade(&ws));
                 } else {
                     ws.borrow_mut().entries.clear();
                 }
+            } else {
+                gc.forget(ptr);
             }
         }
         gc.weaksets = keep;
@@ -302,8 +486,9 @@ impl Engine {
         let promises = core::mem::take(&mut gc.promises);
         let mut keep = Vec::with_capacity(promises.len());
         for w in promises {
+            let ptr = w.as_ptr() as *const ();
             if let Some(p) = w.upgrade() {
-                if marked.contains(&(Rc::as_ptr(&p) as *const ())) {
+                if retain(&mut gc, ptr, marked.contains(&ptr)) {
                     keep.push(Rc::downgrade(&p));
                 } else {
                     let mut b = p.borrow_mut();
@@ -313,6 +498,8 @@ impl Engine {
                         reactions.clear();
                     }
                 }
+            } else {
+                gc.forget(ptr);
             }
         }
         gc.promises = keep;
@@ -322,8 +509,9 @@ impl Engine {
         let envs = core::mem::take(&mut gc.envs);
         let mut keep = Vec::with_capacity(envs.len());
         for w in envs {
+            let ptr = w.as_ptr() as *const ();
             if let Some(env) = w.upgrade() {
-                if marked.contains(&(Rc::as_ptr(&env) as *const ())) {
+                if retain(&mut gc, ptr, marked.contains(&ptr)) {
                     keep.push(Rc::downgrade(&env));
                 } else {
                     let mut b = env.borrow_mut();
@@ -331,6 +519,8 @@ impl Engine {
                     b.constants.clear();
                     b.outer = None;
                 }
+            } else {
+                gc.forget(ptr);
             }
         }
         gc.envs = keep;
@@ -362,6 +552,9 @@ fn mark_value(v: &Value, marked: &mut HashSet<*const ()>, values: &mut Vec<Value
             if marked.insert(Rc::as_ptr(a) as *const ()) {
                 let g = a.borrow();
                 for e in &g.elems {
+                    values.push(e.clone());
+                }
+                for e in g.sparse.values() {
                     values.push(e.clone());
                 }
                 if let Some(pr) = &g.proto {

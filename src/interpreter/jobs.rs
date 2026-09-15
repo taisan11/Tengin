@@ -9,6 +9,7 @@
 use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::cell::RefCell;
+use core::cmp::Ordering;
 
 use crate::error::{Error, Result, Settlement, SuspendCont};
 use crate::value::{
@@ -56,6 +57,28 @@ pub(crate) struct TimerEntry {
     pub args: Vec<Value>,
     /// Repeat interval in ms (`setInterval`; `None` for one-shot).
     pub repeat: Option<u64>,
+}
+
+// `BinaryHeap` is a max-heap; reverse the ordering so the earliest deadline
+// (and then the smallest id for FIFO ties) is popped first.
+impl PartialEq for TimerEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.deadline == other.deadline && self.id == other.id
+    }
+}
+impl Eq for TimerEntry {}
+impl PartialOrd for TimerEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for TimerEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .deadline
+            .cmp(&self.deadline)
+            .then_with(|| other.id.cmp(&self.id))
+    }
 }
 
 /// A `NewPromiseCapability` triple: the constructed promise plus the
@@ -110,7 +133,9 @@ impl Engine {
         let mut data = PromiseData::new_pending();
         data.proto = proto;
         let p = Rc::new(RefCell::new(data));
-        self.gc.borrow_mut().promises.push(Rc::downgrade(&p));
+        let mut gc = self.gc.borrow_mut();
+        gc.promises.push(Rc::downgrade(&p));
+        gc.register(Rc::as_ptr(&p) as *const ());
         self.gc_pressure.set(self.gc_pressure.get() + 1);
         p
     }
@@ -455,9 +480,16 @@ impl Engine {
         }
         match x {
             Value::Promise(other) => {
-                let state = other.borrow().state.clone();
+                let state = {
+                    let b = other.borrow();
+                    match &b.state {
+                        PromiseState::Pending { .. } => None,
+                        PromiseState::Fulfilled(v) => Some(Ok(v.clone())),
+                        PromiseState::Rejected(e) => Some(Err(e.clone())),
+                    }
+                };
                 match state {
-                    PromiseState::Pending { .. } => {
+                    None => {
                         self.mark_handled(&Value::Promise(other.clone()));
                         other.borrow_mut().pending_push(PromiseReaction {
                             kind: PromiseReactionKind::Forward,
@@ -466,8 +498,8 @@ impl Engine {
                             promise: cap.clone(),
                         });
                     }
-                    PromiseState::Fulfilled(v) => self.fulfill_promise(cap, v),
-                    PromiseState::Rejected(e) => self.reject_promise(cap, e),
+                    Some(Ok(v)) => self.fulfill_promise(cap, v),
+                    Some(Err(e)) => self.reject_promise(cap, e),
                 }
             }
             _ if Self::is_thenable_value(&x) => {
@@ -542,15 +574,22 @@ impl Engine {
             }
         };
         self.mark_handled(&Value::Promise(p.clone()));
-        let state = p.borrow().state.clone();
+        let state = {
+            let b = p.borrow();
+            match &b.state {
+                PromiseState::Pending { .. } => None,
+                PromiseState::Fulfilled(v) => Some(Ok(v.clone())),
+                PromiseState::Rejected(e) => Some(Err(e.clone())),
+            }
+        };
         match state {
-            PromiseState::Pending { .. } => {
+            None => {
                 p.borrow_mut().pending_push(reaction);
             }
-            PromiseState::Fulfilled(v) => {
+            Some(Ok(v)) => {
                 self.enqueue_reaction_job(reaction, Settlement::Fulfilled(v));
             }
-            PromiseState::Rejected(e) => {
+            Some(Err(e)) => {
                 self.enqueue_reaction_job(reaction, Settlement::Rejected(e));
             }
         }
@@ -1015,19 +1054,17 @@ impl Engine {
     /// Cancel a timer by id (shared `setTimeout`/`setInterval` namespace).
     /// Returns whether anything was removed.
     pub(crate) fn clear_timer(&self, id: u64) -> bool {
-        let mut timers = self.timers.borrow_mut();
-        let before = timers.len();
-        timers.retain(|t| t.id != id);
-        let removed = timers.len() != before;
+        // Entries are removed lazily from the heap. Remembering the id avoids
+        // an O(n) retain and also handles cancellation from an in-flight
+        // callback.
+        let removed = self.timers.borrow().iter().any(|t| t.id == id);
         // Always remember the cancel: the target may be in flight right now
         // (already popped for firing), in which case `retain` finds nothing
         // but the repeat must still not reschedule. Pruned by the pump when
         // idle (never here: the queue may look empty mid-flight).
         {
             let mut list = self.cancelled_timers.borrow_mut();
-            if !list.iter().any(|c| *c == id) {
-                list.push(id);
-            }
+            list.insert(id);
         }
         removed
     }
@@ -1042,23 +1079,16 @@ impl Engine {
         let mut ran = 0usize;
         while ran < limit {
             // Earliest deadline (ties broken by smallest id = FIFO).
-            let next = self
-                .timers
-                .borrow()
-                .iter()
-                .min_by_key(|t| (t.deadline, t.id))
-                .cloned();
-            let Some(timer) = next else {
+            let Some(timer) = self.timers.borrow_mut().pop() else {
                 self.cancelled_timers.borrow_mut().clear();
                 break;
             };
+            if self.cancelled_timers.borrow_mut().remove(&timer.id) {
+                continue;
+            }
             if timer.deadline > self.now_ms.get() {
                 self.now_ms.set(timer.deadline);
             }
-            // Remove exactly this entry (a repeat re-inserts below).
-            self.timers
-                .borrow_mut()
-                .retain(|t| t.id != timer.id);
             ran += 1;
             match self.call_function(&timer.callback, &Value::Undefined, &timer.args) {
                 Ok(_) => {}
@@ -1077,10 +1107,7 @@ impl Engine {
                 // Skip rescheduling when cleared from inside the callback.
                 let cancelled = {
                     let mut list = self.cancelled_timers.borrow_mut();
-                    let hit = list.iter().any(|c| *c == timer.id);
-                    if hit {
-                        list.retain(|c| *c != timer.id);
-                    }
+                    let hit = list.remove(&timer.id);
                     if self.timers.borrow().is_empty() {
                         list.clear();
                     }
