@@ -6,17 +6,28 @@ on:
 permissions:
   contents: write
 
-# Do not let two manual runs race while committing the same log file.
+# Do not let two manual runs race while committing the same aggregate log file.
 concurrency:
   group: test262-full
   cancel-in-progress: false
 
+env:
+  TEST262_SHARD_COUNT: "16"
+
 jobs:
   test262:
+    name: test262 shard ${{ matrix.shard }}/16
     runs-on: ubuntu-latest
-    # A full test262 run can be lengthy, but the per-test timeout in the
-    # runner prevents an individual test from hanging indefinitely.
     timeout-minutes: 360
+
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+
+    env:
+      SHARD_INDEX: ${{ matrix.shard }}
+      LOG_FILE: test262-logs/shard-${{ matrix.shard }}.log
 
     steps:
       - name: Check out repository and test262
@@ -27,19 +38,20 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Start run log
+      - name: Start shard log
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p test262-logs
           {
-            echo "Full test262 run"
+            echo "Full test262 sharded run"
             echo "run_id: ${GITHUB_RUN_ID}"
             echo "run_number: ${GITHUB_RUN_NUMBER}"
             echo "sha: ${GITHUB_SHA}"
+            echo "shard: ${SHARD_INDEX}/${TEST262_SHARD_COUNT}"
             echo "started_at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo
-          } > test262-logs/latest.log
+          } > "${LOG_FILE}"
 
       - name: Build workspace
         id: build
@@ -52,34 +64,36 @@ jobs:
             status=$?
             echo "build_exit_code: ${status}"
             exit "${status}"
-          } 2>&1 | tee -a test262-logs/latest.log
+          } 2>&1 | tee -a "${LOG_FILE}"
           status=${PIPESTATUS[0]}
           set -e
           exit "${status}"
 
-      - name: Run the full test262 suite
+      - name: Run test262 shard
         if: steps.build.outcome == 'success'
         continue-on-error: true
-        # Leave time for the final log commit even if the suite reaches the
-        # GitHub Actions job limit.
+        # Leave time for artifact upload and aggregate-log creation.
         timeout-minutes: 350
         shell: bash
         run: |
           set +e
           {
             echo
-            echo "=== tengin-test262 (full suite) ==="
-            echo "command: target/release/tengin-test262 --timeout 60"
-            ./target/release/tengin-test262 --timeout 60
+            echo "=== tengin-test262 shard ${SHARD_INDEX}/${TEST262_SHARD_COUNT} ==="
+            echo "command: target/release/tengin-test262 --timeout 60 --jobs 1 --shard ${SHARD_INDEX}/${TEST262_SHARD_COUNT}"
+            ./target/release/tengin-test262 \
+              --timeout 60 \
+              --jobs 1 \
+              --shard "${SHARD_INDEX}/${TEST262_SHARD_COUNT}"
             status=$?
             echo "test262_exit_code: ${status}"
             exit "${status}"
-          } 2>&1 | tee -a test262-logs/latest.log
+          } 2>&1 | tee -a "${LOG_FILE}"
           status=${PIPESTATUS[0]}
           set -e
           exit "${status}"
 
-      - name: Finish run log
+      - name: Finish shard log
         if: always()
         shell: bash
         run: |
@@ -87,17 +101,95 @@ jobs:
           {
             echo
             echo "finished_at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          } >> test262-logs/latest.log
+          } >> "${LOG_FILE}"
 
-      - name: Commit and push the log
+      - name: Upload shard log
         if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test262-shard-${{ matrix.shard }}
+          path: ${{ env.LOG_FILE }}
+          if-no-files-found: error
+          retention-days: 14
+
+  aggregate:
+    name: Aggregate test262 results
+    if: always()
+    needs: test262
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Prepare log directory
+        shell: bash
+        run: mkdir -p test262-logs/shards
+
+      - name: Download shard logs
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: test262-shard-*
+          path: test262-logs/shards
+          merge-multiple: true
+
+      - name: Build aggregate log
+        id: aggregate
         shell: bash
         run: |
           set -euo pipefail
-          if [[ ! -f test262-logs/latest.log ]]; then
-            echo "No run log was created; nothing to commit."
-            exit 0
+
+          mapfile -t logs < <(
+            find test262-logs/shards -maxdepth 1 -type f -name 'shard-*.log' -print | sort -V
+          )
+
+          found="${#logs[@]}"
+          pass=0
+          fail=0
+          skip=0
+          files_run=0
+
+          if (( found > 0 )); then
+            pass="$(awk '/^  PASS[[:space:]]*:/ {sum += $NF} END {print sum + 0}' "${logs[@]}")"
+            fail="$(awk '/^  FAIL[[:space:]]*:/ {sum += $NF} END {print sum + 0}' "${logs[@]}")"
+            skip="$(awk '/^  SKIP[[:space:]]*:/ {sum += $NF} END {print sum + 0}' "${logs[@]}")"
+            files_run="$(awk '/^files run[[:space:]]*:/ {sum += $NF} END {print sum + 0}' "${logs[@]}")"
           fi
+
+          cases=$((pass + fail + skip))
+          pass_rate="$(awk -v p="${pass}" -v t="${cases}" \
+            'BEGIN { if (t > 0) printf "%.2f", (p / t) * 100; else printf "0.00" }')"
+
+          {
+            echo "Full test262 sharded run"
+            echo "run_id: ${GITHUB_RUN_ID}"
+            echo "run_number: ${GITHUB_RUN_NUMBER}"
+            echo "sha: ${GITHUB_SHA}"
+            echo "shards_found: ${found}/${TEST262_SHARD_COUNT}"
+            echo "files_run: ${files_run}"
+            echo "cases: ${cases}"
+            echo "PASS: ${pass}"
+            echo "FAIL: ${fail}"
+            echo "SKIP: ${skip}"
+            echo "pass_rate: ${pass_rate}%"
+            echo "aggregated_at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo
+
+            for log in "${logs[@]}"; do
+              echo "===== $(basename "${log}") ====="
+              cat "${log}"
+              echo
+            done
+          } > test262-logs/latest.log
+
+          echo "shards_found=${found}" >> "${GITHUB_OUTPUT}"
+
+      - name: Commit and push aggregate log
+        shell: bash
+        run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add test262-logs/latest.log
@@ -109,3 +201,15 @@ jobs:
 
           git commit -m "ci: update full test262 log [skip ci]"
           git push origin "HEAD:${GITHUB_REF_NAME}"
+
+      - name: Verify all shards uploaded
+        if: always()
+        shell: bash
+        env:
+          SHARDS_FOUND: ${{ steps.aggregate.outputs.shards_found }}
+        run: |
+          set -euo pipefail
+          if [[ "${SHARDS_FOUND:-0}" != "${TEST262_SHARD_COUNT}" ]]; then
+            echo "Expected ${TEST262_SHARD_COUNT} shard logs, found ${SHARDS_FOUND:-0}."
+            exit 1
+          fi
