@@ -1,67 +1,53 @@
 //! A command-line runner for the test262 conformance suite.
 //!
 //! Usage:
-//!   tengin-test262 [filters...] [-v] [--test262 PATH] [--timeout N]
+//!   tengin-test262 [filters...] [-v] [--test262 PATH] [--timeout N] [--jobs N] [--shard N/M]
 //!
 //! * `filters`   – if any are given, only tests whose path contains one of the
 //!                 substrings are executed (handy for a single directory/file).
 //! * `-v`        – print every failing (and skipped) test after the run.
 //! * `--test262` – override the location of the test262 checkout
 //!                 (defaults to `vendor/test262`).
-//! * `--timeout` – per-test timeout in seconds (default 10); tests that exceed
+//! * `--timeout` – per-test timeout in seconds (default 60); tests that exceed
 //!                 it are reported as failures instead of hanging the run.
+//! * `--jobs`    – maximum number of test processes to run concurrently
+//!                 (default 2).
+//! * `--shard`   – run one zero-based shard of the filtered test list, for
+//!                 example `--shard 3/16`.
 //!
 //! Concurrency model
 //! -----------------
-//! A fixed pool of `num_threads` worker threads pulls test indices off a shared
-//! atomic cursor and executes them. Each test is run in its *own* short-lived
-//! thread so that a misbehaving test (infinite loop, stack overflow) cannot
-//! corrupt or permanently block a worker. To keep memory and CPU bounded even
-//! when tests hang, the number of concurrently in-flight test threads is capped
-//! by a semaphore of size `num_threads`: a test that times out is detached
-//! (its thread is abandoned, not joined) and keeps holding its permit until it
-//! actually finishes, so at most `num_threads` such threads can accumulate.
+//! A fixed pool of worker threads pulls test indices off a shared atomic cursor.
+//! Each worker launches one test file in its own short-lived child process. The
+//! child process boundary keeps per-test heap growth, leaks, panics, and crashes
+//! isolated from the parent runner. A watchdog kills a child that exceeds the
+//! configured per-test timeout, so the maximum number of in-flight engines is
+//! exactly `--jobs`.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use tengin_test262::{collect_test_files, is_excluded, load_excludelist, run_test_file, Status, TestOutcome};
+use tengin_test262::{
+    collect_test_files, is_excluded, load_excludelist, run_test_file, Status, TestOutcome,
+};
 
-/// A counting semaphore used to bound the number of concurrently executing test
-/// threads. Permits are released by the test thread when it exits; on timeout a
-/// thread is detached without releasing its permit, which caps how many hung
-/// tests can pile up.
-struct Semaphore {
-    permits: Mutex<usize>,
-    cvar: Condvar,
+fn parse_shard_spec(value: &str) -> Option<(usize, usize)> {
+    let (index, count) = value.split_once('/')?;
+    let index = index.parse::<usize>().ok()?;
+    let count = count.parse::<usize>().ok()?;
+    if count == 0 || index >= count {
+        return None;
+    }
+    Some((index, count))
 }
 
-impl Semaphore {
-    fn new(n: usize) -> Self {
-        Semaphore {
-            permits: Mutex::new(n),
-            cvar: Condvar::new(),
-        }
-    }
-
-    fn acquire(&self) {
-        let mut p = self.permits.lock().unwrap();
-        while *p == 0 {
-            p = self.cvar.wait(p).unwrap();
-        }
-        *p -= 1;
-    }
-
-    fn release(&self) {
-        let mut p = self.permits.lock().unwrap();
-        *p += 1;
-        drop(p);
-        self.cvar.notify_one();
-    }
+fn parse_jobs(value: &str) -> Option<usize> {
+    let jobs = value.parse::<usize>().ok()?;
+    (jobs > 0).then_some(jobs)
 }
 
 fn main() {
@@ -93,6 +79,8 @@ fn main() {
     let mut test262_root = PathBuf::from("vendor/test262");
     let mut filters: Vec<String> = Vec::new();
     let mut timeout_secs: u64 = 60;
+    let mut num_threads: usize = 2;
+    let mut shard: Option<(usize, usize)> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -100,23 +88,89 @@ fn main() {
             "-v" | "--verbose" => verbose = true,
             "--test262" => {
                 i += 1;
-                if i < args.len() {
-                    test262_root = PathBuf::from(&args[i]);
+                if i >= args.len() {
+                    eprintln!("--test262 requires a path");
+                    std::process::exit(2);
                 }
+                test262_root = PathBuf::from(&args[i]);
             }
             "--timeout" => {
                 i += 1;
-                if i < args.len() {
-                    if let Ok(t) = args[i].parse::<u64>() {
-                        timeout_secs = t;
+                if i >= args.len() {
+                    eprintln!("--timeout requires a number of seconds");
+                    std::process::exit(2);
+                }
+                match args[i].parse::<u64>() {
+                    Ok(t) if t > 0 => timeout_secs = t,
+                    _ => {
+                        eprintln!("invalid --timeout value: {}", args[i]);
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "--jobs" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("--jobs requires a positive integer");
+                    std::process::exit(2);
+                }
+                match parse_jobs(&args[i]) {
+                    Some(jobs) => num_threads = jobs,
+                    None => {
+                        eprintln!("invalid --jobs value: {}", args[i]);
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "--shard" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("--shard requires N/M, for example 3/16");
+                    std::process::exit(2);
+                }
+                match parse_shard_spec(&args[i]) {
+                    Some(spec) => shard = Some(spec),
+                    None => {
+                        eprintln!(
+                            "invalid --shard value: {} (expected zero-based N/M with N < M)",
+                            args[i]
+                        );
+                        std::process::exit(2);
                     }
                 }
             }
             other => {
                 if let Some(v) = other.strip_prefix("--test262=") {
                     test262_root = PathBuf::from(v);
+                } else if let Some(v) = other.strip_prefix("--timeout=") {
+                    match v.parse::<u64>() {
+                        Ok(t) if t > 0 => timeout_secs = t,
+                        _ => {
+                            eprintln!("invalid --timeout value: {v}");
+                            std::process::exit(2);
+                        }
+                    }
+                } else if let Some(v) = other.strip_prefix("--jobs=") {
+                    match parse_jobs(v) {
+                        Some(jobs) => num_threads = jobs,
+                        None => {
+                            eprintln!("invalid --jobs value: {v}");
+                            std::process::exit(2);
+                        }
+                    }
+                } else if let Some(v) = other.strip_prefix("--shard=") {
+                    match parse_shard_spec(v) {
+                        Some(spec) => shard = Some(spec),
+                        None => {
+                            eprintln!(
+                                "invalid --shard value: {v} (expected zero-based N/M with N < M)"
+                            );
+                            std::process::exit(2);
+                        }
+                    }
                 } else if other.starts_with('-') && other != "-" {
                     eprintln!("unknown option: {other}");
+                    std::process::exit(2);
                 } else {
                     filters.push(other.to_string());
                 }
@@ -138,6 +192,10 @@ fn main() {
 
     let mut files = collect_test_files(&test_dir);
     let total_files = files.len();
+
+    // Stable ordering makes shard membership deterministic across machines.
+    files.sort();
+
     files.retain(|p| {
         if is_excluded(p, &excludes) {
             return false;
@@ -151,16 +209,40 @@ fn main() {
         true
     });
 
+    let matched_files = files.len();
+    if let Some((shard_index, shard_count)) = shard {
+        files = files
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, path)| {
+                (index % shard_count == shard_index).then_some(path)
+            })
+            .collect();
+    }
+
     if files.is_empty() {
         println!("no test files matched the given criteria");
         return;
     }
 
-    println!(
-        "Running {} test files from {:?} ...",
-        files.len(),
-        test262_root.display()
-    );
+    if let Some((shard_index, shard_count)) = shard {
+        println!(
+            "Running {} test files from {:?} (shard {}/{}, {} matched before sharding, jobs={}) ...",
+            files.len(),
+            test262_root.display(),
+            shard_index,
+            shard_count,
+            matched_files,
+            num_threads
+        );
+    } else {
+        println!(
+            "Running {} test files from {:?} (jobs={}) ...",
+            files.len(),
+            test262_root.display(),
+            num_threads
+        );
+    }
 
     let files = Arc::new(files);
     let cursor = Arc::new(AtomicUsize::new(0));
@@ -169,12 +251,6 @@ fn main() {
     let fail = Arc::new(AtomicUsize::new(0));
     let skip = Arc::new(AtomicUsize::new(0));
     let done = Arc::new(AtomicUsize::new(0));
-
-    let num_threads = 2; // TEMP: capped for peak-memory measurement
-
-    // Cap concurrently in-flight test threads so hung tests cannot accumulate
-    // without bound.
-    let sem = Arc::new(Semaphore::new(num_threads));
 
     let start = Instant::now();
     let mut handles = Vec::new();
@@ -186,61 +262,15 @@ fn main() {
         let fail = fail.clone();
         let skip = skip.clone();
         let done = done.clone();
-        let sem = sem.clone();
+
         handles.push(thread::spawn(move || loop {
             let idx = cursor.fetch_add(1, Ordering::Relaxed);
             if idx >= files.len() {
                 break;
             }
 
-            // Borrow the path from the shared vec so we avoid cloning it into the
-            // worker thread.
-            let path: PathBuf = files[idx].clone();
-            let path_for_worker = path.clone();
-
-            let sem = sem.clone();
-            let sem_for_timeout = sem.clone();
-            let (tx, rx) = std::sync::mpsc::channel();
-            sem.acquire();
-            // Give each test its own thread with a bounded large stack: the
-            // interpreter is a tree-walker that recurses on the Rust call
-            // stack, so deeply nested programs need more than the default 2MB.
-            let worker = thread::Builder::new()
-                .stack_size(16 * 1024 * 1024)
-                .spawn(move || {
-                let outcomes = run_test_subprocess(&path_for_worker, timeout_secs);
-                let _ = tx.send(outcomes);
-                // Hand the permit back only once the test thread is done.
-                sem.release();
-            })
-            .unwrap();
-
-            let outcomes = match rx.recv_timeout(Duration::from_secs(timeout_secs)) {
-                Ok(o) => {
-                    // Test finished in time; reap the thread (it has already
-                    // released its permit).
-                    let _ = worker.join();
-                    o
-                }
-                Err(_) => {
-                    // Timed out. Detach the worker instead of joining it so we
-                    // never block on a hung test. Release the permit so later
-                    // tests can continue; the bounded stack limits detached
-                    // worker memory.
-                    sem_for_timeout.release();
-                    fail.fetch_add(1, Ordering::Relaxed);
-                    if verbose {
-                        eprintln!("FAIL [non-strict] {}: timeout", path.display());
-                        failures.lock().unwrap().push(TestOutcome {
-                            path: path.to_string_lossy().to_string(),
-                            strict: false,
-                            status: Status::Fail,
-                            detail: "timeout".to_string(),
-                        });
-                    }
-                    continue;
-                }
-            };
+            let path = &files[idx];
+            let outcomes = run_test_subprocess(path, timeout_secs);
 
             for o in outcomes {
                 match o.status {
@@ -260,6 +290,7 @@ fn main() {
                     }
                 }
             }
+
             let completed = done.fetch_add(1, Ordering::Relaxed) + 1;
             if completed % 1000 == 0 || completed == files.len() {
                 eprintln!(
@@ -273,6 +304,7 @@ fn main() {
             }
         }));
     }
+
     for h in handles {
         let _ = h.join();
     }
@@ -286,7 +318,12 @@ fn main() {
     println!();
     println!("=== test262 run complete ===");
     println!("files scanned : {total_files}");
+    println!("files matched : {matched_files}");
     println!("files run     : {}", files.len());
+    if let Some((shard_index, shard_count)) = shard {
+        println!("shard         : {shard_index}/{shard_count}");
+    }
+    println!("jobs          : {num_threads}");
     println!("cases         : {total}");
     println!("  PASS        : {p}");
     println!("  FAIL        : {f}");
@@ -306,8 +343,8 @@ fn main() {
 }
 
 /// Execute one test in a child process and terminate it if it exceeds the
-/// configured timeout. This prevents detached interpreter threads from
-/// retaining unbounded heap graphs during a full-suite run.
+/// configured timeout. This prevents interpreter heap graphs from surviving
+/// between test files and gives the parent a reliable kill boundary.
 fn run_test_subprocess(path: &Path, timeout_secs: u64) -> Vec<TestOutcome> {
     let exe = match std::env::current_exe() {
         Ok(p) => p,
@@ -320,6 +357,7 @@ fn run_test_subprocess(path: &Path, timeout_secs: u64) -> Vec<TestOutcome> {
             }]
         }
     };
+
     let mut child = match Command::new(exe)
         .arg("--single")
         .arg(path)
@@ -371,14 +409,16 @@ fn run_test_subprocess(path: &Path, timeout_secs: u64) -> Vec<TestOutcome> {
             path: path.to_string_lossy().to_string(),
             strict: false,
             status: Status::Fail,
-            detail: "test runner exited without a result".to_string(),
+            detail: abnormal_exit_detail(&status),
         }];
     };
+
     let encoded = (code - 10) as usize;
     let pass = encoded / 9;
     let fail = (encoded % 9) / 3;
     let skip = encoded % 3;
     let mut outcomes = Vec::with_capacity(pass + fail + skip);
+
     for _ in 0..pass {
         outcomes.push(TestOutcome {
             path: path.to_string_lossy().to_string(),
@@ -403,5 +443,27 @@ fn run_test_subprocess(path: &Path, timeout_secs: u64) -> Vec<TestOutcome> {
             detail: String::new(),
         });
     }
+
     outcomes
+}
+
+fn abnormal_exit_detail(status: &ExitStatus) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+
+        if let Some(signal) = status.signal() {
+            return match signal {
+                6 => "test runner aborted (SIGABRT)".to_string(),
+                9 => "test runner killed (SIGKILL; possible OOM)".to_string(),
+                11 => "test runner crashed (SIGSEGV)".to_string(),
+                _ => format!("test runner terminated by signal {signal}"),
+            };
+        }
+    }
+
+    match status.code() {
+        Some(code) => format!("test runner exited without a result (code {code})"),
+        None => "test runner exited without a result".to_string(),
+    }
 }
